@@ -246,7 +246,7 @@ class PPO:
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
 
         # calculate advantages
-        logger.info(f"rewards shape: {rewards.shape}, old_state_values shape: {old_state_values.shape}")
+        #logger.info(f"rewards shape: {rewards.shape}, old_state_values shape: {old_state_values.shape}")
         advantages = rewards.detach() - old_state_values.detach()
 
         # Optimize policy for K epochs
