@@ -83,3 +83,77 @@ class Block(nn.Module):
         return x
     
 
+
+class gridGPT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = {
+            'vocab_size': 256,
+            'block_size': 64,
+            'n_embd': 128,
+            'n_head': 4,
+            'head_size': 32,
+            'num_layers': 4,
+            'dropout': 0.1
+        }
+
+        self.prev_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
+        self.action_embedding = nn.Embedding(self.config['action_size'], self.config['n_embd'])
+        self.next_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
+        self.trajectory_embedding = nn.Linear(self.config['fusion_embed_dim'], self.config['n_embd'])
+
+        self.trajectory_positional_embedding = nn.Linear(self.config['n_embd'], self.config['n_embd']*2)
+
+        self.ln_f = nn.LayerNorm(self.config['n_embd'])
+        self.lm_head = nn.Linear(self.config['n_embd'], self.config['action_size'])
+
+        self.apply(self._init_weights)
+
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    
+    def forward(self, prev_state, action, next_state):
+        """
+        Args:
+            prev_state:  [B, state_dim]   - previous state features
+            action:      [B] or [B, 1]    - previous action (LongTensor indices)
+            next_state:  [B, state_dim]   - current state features (S_t)
+
+        Returns:
+            logits: [B, action_size]  - action logits for the NEXT action (A_t)
+        """
+        # 1) per-part embeddings → [B, n_embd] each
+        e_prev = self.prev_state_embedding(prev_state)      # [B, n_embd]
+        e_act  = self.action_embedding(action.squeeze(-1) if action.ndim == 2 else action)  # [B, n_embd]
+        e_next = self.next_state_embedding(next_state)      # [B, n_embd]
+
+        # 2) fuse by concatenation → [B, 3*n_embd], then project to [B, n_embd]
+        fused_in = torch.cat([e_prev, e_act, e_next], dim=-1)  # [B, 3*n_embd]
+        # sanity check: the fusion input must match trajectory_embedding.in_features
+        if fused_in.size(-1) != self.trajectory_embedding.in_features:
+            raise ValueError(
+                f"fusion_embed_dim mismatch: got {fused_in.size(-1)} but "
+                f"trajectory_embedding expects {self.trajectory_embedding.in_features}. "
+                f"Set config['fusion_embed_dim'] = 3 * n_embd or adjust your embeddings."
+            )
+        token = self.trajectory_embedding(fused_in)  # [B, n_embd]
+
+        # 3) lightweight mixing using your 'trajectory_positional_embedding' (produces 2*n_embd)
+        #    interpret as FiLM-style scale/shift on the fused token
+        mix = self.trajectory_positional_embedding(token)   # [B, 2*n_embd]
+        scale, shift = mix.chunk(2, dim=-1)                 # each [B, n_embd]
+        token = token * torch.sigmoid(scale) + shift        # [B, n_embd]
+
+        # 4) norm → head
+        token = self.ln_f(token)                            # [B, n_embd]
+        logits = self.lm_head(token)                        # [B, action_size]
+
+        return logits
+
