@@ -13,9 +13,9 @@ import numpy as np
 class Head(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.key = nn.Linear(config['n_emb'], config['head_size'], bias=False)
-        self.query = nn.Linear(config['n_emb'], config['head_size'], bias=False)
-        self.value = nn.Linear(config['n_emb'], config['head_size'], bias=False)
+        self.key = nn.Linear(config['n_embd'], config['head_size'], bias=False)
+        self.query = nn.Linear(config['n_embd'], config['head_size'], bias=False)
+        self.value = nn.Linear(config['n_embd'], config['head_size'], bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(config['block_size'], config['block_size'])))
         self.dropout = nn.Dropout(config['dropout'])
 
@@ -40,8 +40,8 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.heads = nn.ModuleList([Head(config['head_size']) for _ in range(config['num_heads'])])
-        self.proj = nn.Linear(config['head_size'] * config['num_heads'], config['n_emb'])
+        self.heads = nn.ModuleList([Head(config) for _ in range(config['n_head'])])
+        self.proj = nn.Linear(config['head_size'] * config['n_head'], config['n_embd'])
         self.dropout = nn.Dropout(config['dropout'])
 
     def forward(self, x):
@@ -70,8 +70,8 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         head_size = config['n_embd'] // config['n_head']
-        self.selfAttention = MultiHeadAttention(config['n_head'], head_size)
-        self.ffwd = FeedForward(config['n_embd'])
+        self.selfAttention = MultiHeadAttention(config)
+        self.ffwd = FeedForward(config)
         self.ln1 = nn.LayerNorm(config['n_embd'])
         self.ln2 = nn.LayerNorm(config['n_embd'])
 
@@ -88,28 +88,39 @@ class gridGPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = {
-            'vocab_size': 256,
+            'action_size': 178,
             'block_size': 64,
+            'state_dim': 10,
             'n_embd': 128,
+            'fusion_embed_dim': 3 * 128,  # 3 * n_embd
             'n_head': 4,
             'head_size': 32,
-            'num_layers': 4,
-            'dropout': 0.1
+            'n_layers': 4,
+            'dropout': 0.1,
+            'context_len': 16,       # window length L (slot indices 0..L-1)
+            'max_timestep': 10000,    # max absolute env step used for embeddings
         }
 
+        # ===== embeddings =====
         self.prev_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
-        self.action_embedding = nn.Embedding(self.config['action_size'], self.config['n_embd'])
+        self.action_embedding     = nn.Embedding(self.config['action_size'], self.config['n_embd'])
         self.next_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
         self.trajectory_embedding = nn.Linear(self.config['fusion_embed_dim'], self.config['n_embd'])
 
-        self.trajectory_positional_embedding = nn.Linear(self.config['n_embd'], self.config['n_embd']*2)
+        # ===== HYBRID POSITIONAL ENCODING (NEW) =====
+        # learned slot embedding (relative position inside the window) and absolute time embedding
+        self.idx_embedding  = nn.Embedding(self.config['context_len'], self.config['n_embd'])
+        self.time_embedding = nn.Embedding(self.config['max_timestep'], self.config['n_embd'])
+        # FiLM-style scale/shift produced from the positional vector
+        self.trajectory_positional_embedding = nn.Linear(self.config['n_embd'], self.config['n_embd'] * 2)
 
-        self.ln_f = nn.LayerNorm(self.config['n_embd'])
-        self.lm_head = nn.Linear(self.config['n_embd'], self.config['action_size'])
+        # heads 
+        self.ln_f   = nn.LayerNorm(self.config['n_embd'])
+        self.lm_head= nn.Linear(self.config['n_embd'], self.config['action_size'])
+        self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
 
         self.apply(self._init_weights)
 
-    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -118,42 +129,41 @@ class gridGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    
-    def forward(self, prev_state, action, next_state):
+    def forward(self, prev_state, action, next_state, slot_idx=None, timestep=None, action_mask_last=None):
         """
         Args:
-            prev_state:  [B, state_dim]   - previous state features
-            action:      [B] or [B, 1]    - previous action (LongTensor indices)
-            next_state:  [B, state_dim]   - current state features (S_t)
+            prev_state: [B, state_dim]    previous state S_{t-1}
+            action:     [B] or [B,1]      previous action A_{t-1} (Long)
+            next_state: [B, state_dim]    current state S_t
+            slot_idx:   [B] (Long, 0..L-1) OPTIONAL window slot index for this token
+            timestep:   [B] (Long, 0..max_timestep-1) OPTIONAL absolute env step
 
         Returns:
-            logits: [B, action_size]  - action logits for the NEXT action (A_t)
+            logits: [B, action_size]  action logits for A_t
         """
-        # 1) per-part embeddings → [B, n_embd] each
-        e_prev = self.prev_state_embedding(prev_state)      # [B, n_embd]
-        e_act  = self.action_embedding(action.squeeze(-1) if action.ndim == 2 else action)  # [B, n_embd]
-        e_next = self.next_state_embedding(next_state)      # [B, n_embd]
+        # content embeddings → fuse into a token
+        B, L, _ = prev_state.shape
 
-        # 2) fuse by concatenation → [B, 3*n_embd], then project to [B, n_embd]
-        fused_in = torch.cat([e_prev, e_act, e_next], dim=-1)  # [B, 3*n_embd]
-        # sanity check: the fusion input must match trajectory_embedding.in_features
-        if fused_in.size(-1) != self.trajectory_embedding.in_features:
-            raise ValueError(
-                f"fusion_embed_dim mismatch: got {fused_in.size(-1)} but "
-                f"trajectory_embedding expects {self.trajectory_embedding.in_features}. "
-                f"Set config['fusion_embed_dim'] = 3 * n_embd or adjust your embeddings."
-            )
-        token = self.trajectory_embedding(fused_in)  # [B, n_embd]
+        # 1) content embeddings per slot
+        e_prev = self.prev_state_embedding(prev_state)        # [B, L, n_embd]
+        e_act  = self.action_embedding(action)           # [B, L, n_embd]
+        e_next = self.next_state_embedding(next_state)        # [B, L, n_embd]
 
-        # 3) lightweight mixing using your 'trajectory_positional_embedding' (produces 2*n_embd)
-        #    interpret as FiLM-style scale/shift on the fused token
-        mix = self.trajectory_positional_embedding(token)   # [B, 2*n_embd]
-        scale, shift = mix.chunk(2, dim=-1)                 # each [B, n_embd]
-        token = token * torch.sigmoid(scale) + shift        # [B, n_embd]
+        fused  = torch.cat([e_prev, e_act, e_next], dim=-1)    # [B, L, 3*n_embd]
+        tokens = self.trajectory_embedding(fused)              # [B, L, n_embd]  == t_k
 
-        # 4) norm → head
-        token = self.ln_f(token)                            # [B, n_embd]
-        logits = self.lm_head(token)                        # [B, action_size]
+        # 2) hybrid positions per slot and add
+        pos = self.idx_embedding(slot_idx) + self.time_embedding(timestep)  # [B, L, n_embd]
+        x = tokens + pos                                                     # [B, L, n_embd]
 
+        # 3) transformer over time (now T=L, not 1)
+        x = self.blocks(x)                           # [B, L, n_embd]
+        h_last = x[:, -1, :]                         # [B, n_embd] decision slot
+
+        # 4) norm → head at last slot
+        h_last = self.ln_f(h_last)                   # [B, n_embd]
+        logits = self.lm_head(h_last)                # [B, action_size]
+        if action_mask_last is not None:
+            logits = logits.masked_fill(~action_mask_last.bool(), float('-inf'))
         return logits
 
