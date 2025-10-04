@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import os
 import numpy as np
+from src.utils.logger import logger
 
 
 
@@ -120,6 +121,7 @@ class gridGPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
 
         self.apply(self._init_weights)
+        self.optimizer = optim.AdamW(self.parameters(), lr=3e-5)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -166,4 +168,28 @@ class gridGPT(nn.Module):
         if action_mask_last is not None:
             logits = logits.masked_fill(~action_mask_last.bool(), float('-inf'))
         return logits
+    
+
+    def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
+        if checkpoint_path:
+            os.makedirs(checkpoint_path, exist_ok=True)
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config
+        }
+        save_path = os.path.join(checkpoint_path, filename)
+        torch.save(checkpoint, save_path)
+        logger.info(f"[SAVE] Checkpoint saved to {save_path}")
+
+
+    def load(self, checkpoint_path, filename="gpt_checkpoint.pth"):
+        file = os.path.join(checkpoint_path, filename)
+        checkpoint = torch.load(file, map_location=self.device)
+
+        self.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.policy.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f"[LOAD] Checkpoint loaded from {file}")
+        return True
 
