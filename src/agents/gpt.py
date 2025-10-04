@@ -5,10 +5,29 @@ import torch.optim as optim
 import os
 import numpy as np
 from src.utils.logger import logger
+from torch.distributions import Categorical
 
 
 
+class RolloutBuffer:
+    def __init__(self):
+        self.actions = []
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.state_values = []
+        self.is_terminals = []
+    
+    def clear(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.state_values[:]
+        del self.is_terminals[:]
 
+    def __len__(self):
+        return len(self.rewards)
 
 
 class Head(nn.Module):
@@ -118,7 +137,10 @@ class gridGPT(nn.Module):
         # heads 
         self.ln_f   = nn.LayerNorm(self.config['n_embd'])
         self.lm_head= nn.Linear(self.config['n_embd'], self.config['action_size'])
+        self.value_head = nn.Linear(self.config['n_embd'], 1)
+
         self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
+
 
         self.apply(self._init_weights)
         self.optimizer = optim.AdamW(self.parameters(), lr=3e-5)
@@ -131,7 +153,7 @@ class gridGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, prev_state, action, next_state, slot_idx=None, timestep=None, action_mask_last=None):
+    def forward(self, prev_state, action, next_state, slot_idx=None, timestep=None, action_mask_last=None, return_value=False):
         """
         Args:
             prev_state: [B, state_dim]    previous state S_{t-1}
@@ -167,7 +189,15 @@ class gridGPT(nn.Module):
         logits = self.lm_head(h_last)                # [B, action_size]
         if action_mask_last is not None:
             logits = logits.masked_fill(~action_mask_last.bool(), float('-inf'))
-        return logits
+        
+        if not return_value:
+            return logits
+        
+        value = self.value_head(h_last).squeeze(-1)  # [B]
+        return logits, value
+
+    
+
     
 
     def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
@@ -193,3 +223,39 @@ class gridGPT(nn.Module):
         logger.info(f"[LOAD] Checkpoint loaded from {file}")
         return True
 
+
+    @torch.no_grad()
+    def act(self,
+            prev_states,      # [B, L, state_dim]
+            prev_actions,     # [B, L] (Long)
+            next_states,      # [B, L, state_dim]
+            slot_idx,         # [B, L] (Long, 0..L-1)
+            timestep,         # [B, L] (Long, 0..max_timestep-1)
+            action_mask_last=None,   # [B, action_size] or None
+            deterministic: bool = False):
+        """
+        Returns:
+            action:         [B] (Long)
+            action_logprob: [B] (float)
+            state_value:    [B] (float)
+            (optionally you can also return probs or entropy if you like)
+        """
+        logits, value = self.forward(
+            prev_states, prev_actions, next_states,
+            slot_idx=slot_idx, timestep=timestep,
+            action_mask_last=action_mask_last,
+            return_value=True
+        )  # logits: [B, A], value: [B]
+
+        # Categorical over the masked logits
+        dist = Categorical(logits=logits)
+
+        if deterministic:
+            action = logits.argmax(dim=-1)                    # [B]
+            # use the same dist to compute logprob of the chosen (greedy) action
+            action_logprob = dist.log_prob(action)            # [B]
+        else:
+            action = dist.sample()                            # [B]
+            action_logprob = dist.log_prob(action)            # [B]
+
+        return action, action_logprob, value
