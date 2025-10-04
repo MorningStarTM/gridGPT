@@ -6,6 +6,8 @@ import os
 import numpy as np
 from src.utils.logger import logger
 from torch.distributions import Categorical
+from src.utils.converter import ActionConverter, MADiscActionConverter
+
 
 
 
@@ -141,9 +143,7 @@ class gridGPT(nn.Module):
 
         self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
 
-
         self.apply(self._init_weights)
-        self.optimizer = optim.AdamW(self.parameters(), lr=3e-5)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -196,9 +196,6 @@ class gridGPT(nn.Module):
         value = self.value_head(h_last).squeeze(-1)  # [B]
         return logits, value
 
-    
-
-    
 
     def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
         if checkpoint_path:
@@ -224,38 +221,36 @@ class gridGPT(nn.Module):
         return True
 
 
-    @torch.no_grad()
-    def act(self,
-            prev_states,      # [B, L, state_dim]
-            prev_actions,     # [B, L] (Long)
-            next_states,      # [B, L, state_dim]
-            slot_idx,         # [B, L] (Long, 0..L-1)
-            timestep,         # [B, L] (Long, 0..max_timestep-1)
-            action_mask_last=None,   # [B, action_size] or None
-            deterministic: bool = False):
-        """
-        Returns:
-            action:         [B] (Long)
-            action_logprob: [B] (float)
-            state_value:    [B] (float)
-            (optionally you can also return probs or entropy if you like)
-        """
-        logits, value = self.forward(
-            prev_states, prev_actions, next_states,
-            slot_idx=slot_idx, timestep=timestep,
-            action_mask_last=action_mask_last,
-            return_value=True
-        )  # logits: [B, A], value: [B]
+    
 
-        # Categorical over the masked logits
-        dist = Categorical(logits=logits)
+class gridGPTAgent:
+    def __init__(self, env, config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.has_continuous_action_space = self.config['has_continuous_action_space']
 
-        if deterministic:
-            action = logits.argmax(dim=-1)                    # [B]
-            # use the same dist to compute logprob of the chosen (greedy) action
-            action_logprob = dist.log_prob(action)            # [B]
-        else:
-            action = dist.sample()                            # [B]
-            action_logprob = dist.log_prob(action)            # [B]
+        self.ac = ActionConverter(env)
+        action_dim = self.ac.n
+        logger.info(f"Using ActionConverter with action size: {action_dim}")
 
-        return action, action_logprob, value
+
+        self.gamma = self.config['gamma']
+        self.eps_clip = self.config['eps_clip']
+        self.K_epochs = self.config['K_epochs']
+        
+        self.buffer = RolloutBuffer()
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=3e-5)
+
+        self.policy = gridGPT.to(self.device)
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.policy.parameters(), 'lr': self.config['lr_actor']}])
+
+        self.policy_old = gridGPT.to(self.device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        self.MseLoss = nn.MSELoss()
+
+
+
+
+
