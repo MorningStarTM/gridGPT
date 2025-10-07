@@ -245,6 +245,34 @@ class gridGPT(nn.Module):
             action_logprob = dist.log_prob(action)    # [B]
 
         return action, action_logprob, value
+    
+
+    def evaluate(self,
+            prev_states,     # [B,L,state_dim]
+            prev_actions,    # [B,L] (Long)
+            next_states,     # [B,L,state_dim]
+            slot_idx,        # [B,L] (Long 0..L-1)
+            timestep,        # [B,L] (Long)
+            action_mask_last=None,   # [B, action_size] or None
+            deterministic: bool=False):
+        logits, value = self.forward(
+            prev_states, prev_actions, next_states,
+            slot_idx=slot_idx, timestep=timestep,
+            action_mask_last=action_mask_last,
+            return_value=True
+        )  # logits:[B,A], value:[B]
+
+        dist = Categorical(logits=logits)
+        if deterministic:
+            action = logits.argmax(dim=-1)            # [B]
+            action_logprob = dist.log_prob(action)    # [B]
+            dist_entropy = dist.entropy()
+        else:
+            action = dist.sample()                    # [B]
+            action_logprob = dist.log_prob(action)    # [B]
+            dist_entropy = dist.entropy()
+        
+        return action_logprob, value, dist_entropy
 
 
     
