@@ -219,6 +219,32 @@ class gridGPT(nn.Module):
         self.policy.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"[LOAD] Checkpoint loaded from {file}")
         return True
+    
+
+    def act(self,
+            prev_states,     # [B,L,state_dim]
+            prev_actions,    # [B,L] (Long)
+            next_states,     # [B,L,state_dim]
+            slot_idx,        # [B,L] (Long 0..L-1)
+            timestep,        # [B,L] (Long)
+            action_mask_last=None,   # [B, action_size] or None
+            deterministic: bool=False):
+        logits, value = self.forward(
+            prev_states, prev_actions, next_states,
+            slot_idx=slot_idx, timestep=timestep,
+            action_mask_last=action_mask_last,
+            return_value=True
+        )  # logits:[B,A], value:[B]
+
+        dist = Categorical(logits=logits)
+        if deterministic:
+            action = logits.argmax(dim=-1)            # [B]
+            action_logprob = dist.log_prob(action)    # [B]
+        else:
+            action = dist.sample()                    # [B]
+            action_logprob = dist.log_prob(action)    # [B]
+
+        return action, action_logprob, value
 
 
     
@@ -239,18 +265,36 @@ class gridGPTAgent:
         self.K_epochs = self.config['K_epochs']
         
         self.buffer = RolloutBuffer()
-        self.optimizer = optim.AdamW(self.policy.parameters(), lr=3e-5)
 
-        self.policy = gridGPT.to(self.device)
-        self.optimizer = torch.optim.Adam([
-                        {'params': self.policy.parameters(), 'lr': self.config['lr_actor']}])
-
-        self.policy_old = gridGPT.to(self.device)
+        self.policy     = gridGPT().to(self.device)
+        self.policy_old = gridGPT().to(self.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
+
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=self.config['lr_actor'])
 
         self.MseLoss = nn.MSELoss()
 
 
+    def select_action(self, prev_state, prev_action, next_state,
+                      slot_idx=None, timestep=None, action_mask_last=None, deterministic=False):
+        # move inputs to device and correct dtypes
+        prev_state  = prev_state.to(self.device)
+        next_state  = next_state.to(self.device)
+        prev_action = prev_action.to(self.device).long()
+        if slot_idx is not None:   slot_idx   = slot_idx.to(self.device).long()
+        if timestep is not None:   timestep   = timestep.to(self.device).long()
+        if action_mask_last is not None:
+            action_mask_last = action_mask_last.to(self.device).bool()
 
+        with torch.no_grad():
+            # assumes you added gridGPT.act(...) returning (action, logprob, value)
+            action, action_logprob, state_val = self.policy_old.act(
+                prev_state, prev_action, next_state,
+                slot_idx, timestep,
+                action_mask_last=action_mask_last,
+                deterministic=deterministic
+            )
 
-
+        action_id = int(action[0].item()) if action.dim() else int(action.item())
+        grid_action = self.ac.act(action_id)
+        return action_id, grid_action, action_logprob, state_val
