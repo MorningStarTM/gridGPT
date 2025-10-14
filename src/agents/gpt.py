@@ -5,7 +5,7 @@ import torch.optim as optim
 import os
 import numpy as np
 from src.utils.logger import logger
-from torch.distributions import Categorical
+from torch.distributions import Categorical, kl_divergence
 from src.utils.converter import ActionConverter, MADiscActionConverter
 
 
@@ -13,20 +13,40 @@ from src.utils.converter import ActionConverter, MADiscActionConverter
 
 class RolloutBuffer:
     def __init__(self):
-        self.actions = []
-        self.states = []
-        self.logprobs = []
-        self.rewards = []
-        self.state_values = []
-        self.is_terminals = []
+        self.seq_prev_states   = []
+        self.seq_actions       = []
+        self.seq_next_states   = []
+        self.seq_slot_idx      = []
+        self.seq_timesteps     = []
+
+
+        self.actions           = []
+        self.teacher_probs     = []
+        self.states            = []
+        self.logprobs          = []
+        self.rewards           = []
+        self.state_values      = []
+        self.is_terminals      = []
+
+        self.last_states       = []   # for teacher on s_t only (next_states[..., -1, :])
     
     def clear(self):
+        del self.seq_prev_states[:]
+        del self.seq_actions[:]
+        del self.seq_next_states[:]
+        del self.seq_slot_idx[:]
+        del self.seq_timesteps[:]
+
         del self.actions[:]
+        del self.teacher_probs[:]
         del self.states[:]
         del self.logprobs[:]
         del self.rewards[:]
         del self.state_values[:]
         del self.is_terminals[:]
+        del self.last_states[:]
+
+
 
     def __len__(self):
         return len(self.rewards)
@@ -197,7 +217,7 @@ class gridGPT(nn.Module):
         return logits, value
 
 
-    def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
+    def save(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
         if checkpoint_path:
             os.makedirs(checkpoint_path, exist_ok=True)
         checkpoint = {
@@ -210,7 +230,7 @@ class gridGPT(nn.Module):
         logger.info(f"[SAVE] Checkpoint saved to {save_path}")
 
 
-    def load(self, checkpoint_path, filename="gpt_checkpoint.pth"):
+    def load(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
         file = os.path.join(checkpoint_path, filename)
         checkpoint = torch.load(file, map_location=self.device)
 
@@ -244,7 +264,7 @@ class gridGPT(nn.Module):
             action = dist.sample()                    # [B]
             action_logprob = dist.log_prob(action)    # [B]
 
-        return action, action_logprob, value
+        return action, action_logprob, value, logits
     
 
     def evaluate(self,
@@ -272,7 +292,7 @@ class gridGPT(nn.Module):
             action_logprob = dist.log_prob(action)    # [B]
             dist_entropy = dist.entropy()
         
-        return action_logprob, value, dist_entropy
+        return action_logprob, value, dist_entropy, logits
 
 
     
@@ -316,7 +336,7 @@ class gridGPTAgent:
 
         with torch.no_grad():
             # assumes you added gridGPT.act(...) returning (action, logprob, value)
-            action, action_logprob, state_val = self.policy_old.act(
+            action, action_logprob, state_val, logits = self.policy_old.act(
                 prev_state, prev_action, next_state,
                 slot_idx, timestep,
                 action_mask_last=action_mask_last,
@@ -328,7 +348,7 @@ class gridGPTAgent:
         return action_id, grid_action, action_logprob, state_val
     
 
-    def update(self):
+    def update(self, teacher):
         # Monte Carlo estimate of returns
         rewards = []
         discounted_reward = 0
@@ -343,11 +363,19 @@ class gridGPTAgent:
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
         # convert list to tensor
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(self.device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
-        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+        prev_states  = torch.stack(self.buffer.seq_prev_states).to(self.device)    # [N, L, sd]
+        action_seq = torch.stack(self.buffer.seq_actions).to(self.device)        # [N, L]
+        next_states  = torch.stack(self.buffer.seq_next_states).to(self.device)    # [N, L, sd]
+        SI  = torch.stack(self.buffer.seq_slot_idx).to(self.device)       # [N, L]
+        timesteps  = torch.stack(self.buffer.seq_timesteps).to(self.device)      # [N, L]
+        #AM  = torch.stack(self.buffer.seq_action_masks).to(self.device)   # [N, A] or [N, L, A]
 
+        old_states = torch.stack(self.buffer.states, dim=0).to(self.device)
+        old_actions = torch.stack(self.buffer.actions, dim=0).to(self.device)
+        old_logprobs = torch.stack(self.buffer.logprobs, dim=0).to(self.device)
+        old_state_values = torch.stack(self.buffer.state_values, dim=0).to(self.device)
+
+        t_idx = prev_states.shape[1] - 1
         # calculate advantages
         #logger.info(f"rewards shape: {rewards.shape}, old_state_values shape: {old_state_values.shape}")
         advantages = rewards.detach() - old_state_values.detach()
@@ -356,7 +384,22 @@ class gridGPTAgent:
         for _ in range(self.K_epochs):
 
             # Evaluating old actions and values
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            logprobs, state_values, dist_entropy, logits = self.policy.evaluate(prev_states, action_seq, next_states, SI, timesteps)
+            with torch.no_grad():
+                _, _, _, teacher_logits = teacher.evaluate(old_states, old_actions)
+
+            if logits.dim() == 3:
+                student_logits_t = logits[:, -1, :]     # last slot (current decision)
+            else:
+                student_logits_t = logits               # already [B, A]
+
+            # KL(teacher || student) = sum p_t * (log p_t - log q_t)
+            teacher_probs = F.softmax(teacher_logits, dim=-1)          # p
+            log_teacher   = torch.log(teacher_probs + 1e-8)              # log p
+            log_student   = F.log_softmax(student_logits_t, dim=-1)      # log q
+
+            kl_per_sample = (teacher_probs * (log_teacher - log_student)).sum(dim=-1)
+            kl_loss = kl_per_sample.mean()
 
             # match state_values tensor dimensions with rewards tensor
             state_values = torch.squeeze(state_values)
@@ -369,7 +412,7 @@ class gridGPTAgent:
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
 
             # final loss of clipped objective PPO
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy + 0.1 * kl_loss
             
             # take gradient step
             self.optimizer.zero_grad()
