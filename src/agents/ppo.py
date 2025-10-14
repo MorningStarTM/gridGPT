@@ -64,7 +64,6 @@ class ActorCritic(nn.Module):
                                 nn.Linear(64, 64),
                                 nn.Tanh(),
                                 nn.Linear(64, action_dim),
-                                nn.Softmax(dim=-1)
                             )
             logger.info(f"Network initialized for actor")
 
@@ -83,7 +82,12 @@ class ActorCritic(nn.Module):
 
 
 
-        
+    def _sanitize_state(self, x: torch.Tensor) -> torch.Tensor:
+        # ensure float32 and replace NaN/Inf
+        x = x.float()
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        return x
+
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
             self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(self.device)
@@ -96,6 +100,8 @@ class ActorCritic(nn.Module):
         raise NotImplementedError
     
     def act(self, state):
+        state = self._sanitize_state(state)
+
 
         if self.has_continuous_action_space:
             action_mean = self.actor(state)
@@ -103,6 +109,8 @@ class ActorCritic(nn.Module):
             dist = MultivariateNormal(action_mean, cov_mat)
         else:
             action_probs = self.actor(state)
+            if torch.isnan(action_probs).any():
+                raise RuntimeError("NaN in actor logits during act(); check input state pipeline.")
             dist = Categorical(action_probs)
 
         action = dist.sample()
@@ -170,6 +178,16 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
+
+
+        self.policy.actor.apply(self._init_weights)
+        self.policy.critic.apply(self._init_weights)
+
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, a=0.01)
+            nn.init.zeros_(m.bias)
+
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
