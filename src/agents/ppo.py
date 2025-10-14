@@ -109,7 +109,7 @@ class ActorCritic(nn.Module):
         action_logprob = dist.log_prob(action)
         state_val = self.critic(state)
 
-        return action.detach(), action_logprob.detach(), state_val.detach()
+        return action.detach(), action_logprob.detach(), state_val.detach(), action_probs
     
     def evaluate(self, state, action):
 
@@ -130,7 +130,7 @@ class ActorCritic(nn.Module):
         dist_entropy = dist.entropy()
         state_values = self.critic(state)
         
-        return action_logprobs, state_values, dist_entropy
+        return action_logprobs, state_values, dist_entropy, action_probs
     
 
 
@@ -208,13 +208,13 @@ class PPO:
         if self.has_continuous_action_space:
             with torch.no_grad():
                 state = torch.FloatTensor(state).to(self.device)
-                action, action_logprob, state_val = self.policy_old.act(state)
+                action, action_logprob, state_val, _ = self.policy_old.act(state)
 
             return action.detach().cpu().numpy().flatten()
         else:
             with torch.no_grad():
                 state = torch.FloatTensor(state).to(self.device)
-                action, action_logprob, state_val = self.policy_old.act(state)
+                action, action_logprob, state_val, _ = self.policy_old.act(state)
             
             #self.buffer.states.append(state)
             #self.buffer.actions.append(action)
