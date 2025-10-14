@@ -171,7 +171,7 @@ class OnlineBC:
                     )
 
                     # teacher (PPO) action id (behavior target) — optional if you need KL/BC targets
-                    teacher_action_idx, teacher_logprob, teacher_value, state_vec = self.teacher.select_action(state.to_vect())
+                    teacher_action_idx, teacher_logprob, teacher_value, _, _ = self.teacher.select_action(state.to_vect())
 
                 else:
                     # do-nothing (when safe) — keep the grid stable
@@ -186,19 +186,36 @@ class OnlineBC:
                 s_prev = s_t.clone()
                 s_t = torch.from_numpy(next_state.to_vect()).to(device).float()
                 a_prev = 0 if action_id == -1 else action_id
-                state  = next_state
+                
 
                 if not is_safe:
-                    if isinstance(state_vec, torch.Tensor):
-                        self.agent.buffer.states.append(state_vec.to(self.agent.device))
+                    ps = prev_states_b[0].detach().to("cpu")     # [L, state_dim]
+                    asq = actions_b[0].detach().to("cpu")        # [L]
+                    ns = next_states_b[0].detach().to("cpu")     # [L, state_dim]
+                    si = slot_idx_full[0].detach().to("cpu")     # [L]
+                    ts = timestep_b[0].detach().to("cpu")        # [L]
+                    am = action_mask_last[0].detach().to("cpu")  # [A] (or [L, A] if per-slot)
+
+                    self.agent.buffer.seq_prev_states.append(ps)
+                    self.agent.buffer.seq_actions.append(asq)
+                    self.agent.buffer.seq_next_states.append(ns)
+                    self.agent.buffer.seq_slot_idx.append(si)
+                    self.agent.buffer.seq_timesteps.append(ts)
+                    #self.agent.buffer.seq_action_masks.append(am)
+
+                    
+                    if isinstance(state.to_vect(), torch.Tensor):
+                        self.agent.buffer.states.append(state.to_vect().to(self.agent.device))
                     else:
-                        self.agent.buffer.states.append(torch.FloatTensor(state_vec).to(self.agent.device))
+                        self.agent.buffer.states.append(torch.FloatTensor(state.to_vect()).to(self.agent.device))
                     self.agent.buffer.actions.append(torch.tensor(action_id, device=self.agent.device))
+                    self.agent.buffer.teacher_probs.append(torch.tensor(teacher_logprob, device=self.agent.device))
                     self.agent.buffer.logprobs.append(logprob.to(self.agent.device))
                     self.agent.buffer.state_values.append(value.to(self.agent.device))
                     self.agent.buffer.rewards.append(torch.tensor(reward, device=self.agent.device, dtype=torch.float32))
                     self.agent.buffer.is_terminals.append(torch.tensor(done, device=self.agent.device, dtype=torch.float32))
 
+                state  = next_state
 
                 # update PPO agent
                 if time_step % self.config['update_timestep'] == 0:
