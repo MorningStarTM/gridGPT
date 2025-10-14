@@ -39,7 +39,7 @@ class OnlineBC:
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
 
-        self.log_dir = self.log_dir + '/' + self.env_name + '/'
+        self.log_dir = self.log_dir + '/' + self.config['ENV_NAME'] + '/'
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
 
@@ -48,16 +48,16 @@ class OnlineBC:
         run_num = len(current_num_files)
 
         #### create new log file for each run
-        self.log_f_name = self.log_dir + '/gridGPT_student_' + self.env_name + "_log_" + str(run_num) + ".csv"
+        self.log_f_name = self.log_dir + '/gridGPT_student_' + self.config['ENV_NAME'] + "_log_" + str(run_num) + ".csv"
 
-        logger.info("current logging run number for " + self.env_name + " : ", run_num)
+        logger.info("current logging run number for " + self.config['ENV_NAME'] + " : ", run_num)
         logger.info("logging at : " + self.log_f_name)
 
         self.directory = "models"
         if not os.path.exists(self.directory):
             os.makedirs(self.directory)
 
-        self.directory = self.directory + '/' + self.env_name + '/'
+        self.directory = self.directory + '/' + self.config['ENV_NAME'] + '/'
         if not os.path.exists(self.directory):
             os.makedirs(self.directory)
         
@@ -70,7 +70,7 @@ class OnlineBC:
         if not os.path.exists(self.reward_folder):
             os.makedirs(self.reward_folder)
 
-        self.reward_folder = self.reward_folder + '/' + self.env_name + '/'
+        self.reward_folder = self.reward_folder + '/' + self.config['ENV_NAME'] + '/'
         if not os.path.exists(self.reward_folder):
             os.makedirs(self.reward_folder) 
         self.reward_folder = self.reward_folder + '/' + 'gridGPT_student_' + '/'
@@ -283,6 +283,6 @@ class OnlineBC:
         logger.info("Total training time  : ", end_time - start_time)
         logger.info("============================================================================================")
 
-        np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
-        np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
+        np.save(os.path.join(self.reward_folder, f"ppo_{self.config['ENV_NAME']}_step_rewards.npy"), np.array(self.step_rewards))
+        np.save(os.path.join(self.reward_folder, f"ppo_{self.config['ENV_NAME']}_episode_rewards.npy"), np.array(self.episode_rewards))
         logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
