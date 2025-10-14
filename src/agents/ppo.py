@@ -64,6 +64,7 @@ class ActorCritic(nn.Module):
                                 nn.Linear(64, 64),
                                 nn.Tanh(),
                                 nn.Linear(64, action_dim),
+                                nn.Softmax(dim=-1)
                             )
             logger.info(f"Network initialized for actor")
 
@@ -180,13 +181,6 @@ class PPO:
         self.MseLoss = nn.MSELoss()
 
 
-        self.policy.actor.apply(self._init_weights)
-        self.policy.critic.apply(self._init_weights)
-
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_uniform_(m.weight, a=0.01)
-            nn.init.zeros_(m.bias)
 
 
     def set_action_std(self, new_action_std):
