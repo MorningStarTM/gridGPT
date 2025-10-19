@@ -219,7 +219,7 @@ class OnlineBC:
 
                 # update PPO agent
                 if time_step % self.config['update_timestep'] == 0:
-                    self.agent.update()
+                    self.agent.update(teacher=self.teacher)
 
                 # if continuous action space; then decay action std of ouput action distribution
                 if self.config['has_continuous_action_space'] and time_step % self.config['action_std_decay_freq'] == 0:
