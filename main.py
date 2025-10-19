@@ -4,7 +4,10 @@ from lightsim2grid import LightSimBackend
 from grid2op.Reward import L2RPNSandBoxScore
 from src.utils.custom_reward import LossReward, MarginReward
 from src.agents.ppo import PPO
+from src.agents.gpt import gridGPTAgent
 from src.trainer.ppo_trainer import AgentTrainer
+from src.trainer.gpt_trainer import OnlineBC
+from src.utils.logger import logger
 
 
 iconfig = {"ENV_NAME" : "l2rpn_case14_sandbox",
@@ -23,7 +26,7 @@ iconfig = {"ENV_NAME" : "l2rpn_case14_sandbox",
             'eps_clip': 0.2,
             'update_freq':512,
 
-            'max_ep_len': 1000,                       # Max timesteps per episode
+            'max_ep_len': 8063,                       # Max timesteps per episode
             'max_training_timesteps': int(3e6),       # Total training steps before stopping
             'action_std_init':0.6,
 
@@ -47,6 +50,13 @@ env = grid2op.make(iconfig['ENV_NAME'],
                     backend=LightSimBackend(),
                     other_rewards={"loss": LossReward, "margin": MarginReward})
 
-agent = PPO(env.observation_space.shape.sum(), env=env, sublist=None, config=iconfig)
-trainer = AgentTrainer(agent, env, config=iconfig)
+teacher = PPO(env.observation_space.shape.sum(), env=env, sublist=None, config=iconfig)
+teacher.load(checkpoint_path="E:\\github_clone\\gridGPT\\models\\l2rpn_case14_sandbox\\PPO", filename="ppo_checkpoint_2.pth")
+logger.info("Teacher loaded from checkpoint.")
+
+agent = gridGPTAgent(env=env, config=iconfig)
+logger.info("Student Agent initialized with \n")
+logger.info(f"{agent.print_param_count()}")
+
+trainer = OnlineBC(agent=agent, teacher=teacher, env=env, config=iconfig)
 trainer.train()
