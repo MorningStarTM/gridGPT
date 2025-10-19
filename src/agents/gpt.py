@@ -425,3 +425,24 @@ class gridGPTAgent:
 
         # clear buffer
         self.buffer.clear()
+
+    
+    def print_param_count(self):
+        def _count(params, trainable_only=True):
+            return sum(p.numel() for p in params if (p.requires_grad or not trainable_only))
+
+        total_params      = _count(self.policy.parameters(), trainable_only=False)
+        trainable_params  = _count(self.policy.parameters(), trainable_only=True)
+
+        # (optional) also show policy_old for sanity
+        total_old     = _count(self.policy_old.parameters(), trainable_only=False)
+        trainable_old = _count(self.policy_old.parameters(), trainable_only=True)
+
+        msg = (f"[PARAMS] gridGPT: {trainable_params/1e6:.2f}M trainable "
+            f"({total_params/1e6:.2f}M total) | "
+            f"policy_old: {trainable_old/1e6:.2f}M trainable "
+            f"({total_old/1e6:.2f}M total)")
+        try:
+            logger.info(msg)
+        except Exception:
+            print(msg)
