@@ -37,6 +37,7 @@ class AgentTrainer:
         self.step_rewards = []     # Stores every single reward at each timestep
         self.thermal_limit = self.env._thermal_limit_a
         self.danger = 0.9
+        self.survival_steps = []
 
         logger.info(""""============================================================================================
                                                 Agent Training Started               
@@ -192,6 +193,7 @@ class AgentTrainer:
 
                 # break; if the episode is over
                 if done:
+                    self.survival_steps.append(t)
                     break
             
             self.episode_rewards.append(current_ep_reward)  
@@ -216,4 +218,5 @@ class AgentTrainer:
 
         np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
         np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
+        np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_survival_steps.npy"), np.array(self.survival_steps))
         logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
