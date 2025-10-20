@@ -386,7 +386,7 @@ class gridGPTAgent:
             # Evaluating old actions and values
             logprobs, state_values, dist_entropy, logits = self.policy.evaluate(prev_states, action_seq, next_states, SI, timesteps)
             with torch.no_grad():
-                _, _, _, teacher_logits = teacher.evaluate(old_states, old_actions)
+                _, _, _, teacher_logits = teacher.policy.evaluate(old_states, old_actions)
 
             if logits.dim() == 3:
                 student_logits_t = logits[:, -1, :]     # last slot (current decision)
