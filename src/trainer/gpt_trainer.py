@@ -90,6 +90,9 @@ class OnlineBC:
     
 
     def train(self):
+        logger.info("""================================================================================
+                    =========================    Online Behaviour cloning   =========================
+                    ================================================================================""")
         start_time = datetime.now().replace(microsecond=0)
         logger.info("Started training at (GMT) : ", start_time)
 
@@ -172,7 +175,7 @@ class OnlineBC:
                     )
 
                     # teacher (PPO) action id (behavior target) — optional if you need KL/BC targets
-                    teacher_action_idx, teacher_logprob, teacher_value, _, _ = self.teacher.select_action(state.to_vect())
+                    teacher_action_idx, _, teacher_logprob, _, _ = self.teacher.select_action(state.to_vect())
 
                 else:
                     # do-nothing (when safe) — keep the grid stable
@@ -210,7 +213,13 @@ class OnlineBC:
                     else:
                         self.agent.buffer.states.append(torch.FloatTensor(state.to_vect()).to(self.agent.device))
                     self.agent.buffer.actions.append(torch.tensor(action_id, device=self.agent.device))
-                    self.agent.buffer.teacher_probs.append(torch.tensor(teacher_logprob, device=self.agent.device))
+                    #self.agent.buffer.teacher_probs.append(torch.tensor(teacher_logprob, device=self.agent.device))
+                    if isinstance(teacher_logprob, torch.Tensor):
+                        self.agent.buffer.teacher_probs.append(teacher_logprob.clone().detach().to(self.agent.device))
+                    else:
+                        self.agent.buffer.teacher_probs.append(
+                            torch.as_tensor(teacher_logprob, dtype=torch.float32, device=self.agent.device)
+                        )
                     self.agent.buffer.logprobs.append(logprob.to(self.agent.device))
                     self.agent.buffer.state_values.append(value.to(self.agent.device))
                     self.agent.buffer.rewards.append(torch.tensor(reward, device=self.agent.device, dtype=torch.float32))
