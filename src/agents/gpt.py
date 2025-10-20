@@ -446,3 +446,42 @@ class gridGPTAgent:
             logger.info(msg)
         except Exception:
             print(msg)
+
+    
+    def save(self, checkpoint_path: str, filename: str = "gridgpt_agent.pth"):
+        """Save policy, target policy, optimizer, and config."""
+        if checkpoint_path:
+            os.makedirs(checkpoint_path, exist_ok=True)
+        checkpoint = {
+            "policy_state_dict": self.policy.state_dict(),
+            "policy_old_state_dict": self.policy_old.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": self.config,
+        }
+        save_path = os.path.join(checkpoint_path, filename)
+        torch.save(checkpoint, save_path)
+        logger.info(f"[SAVE] gridGPTAgent checkpoint saved to {save_path}")
+
+
+    def load(self, checkpoint_path: str, filename: str = "gridgpt_agent.pth", strict: bool = True):
+        """Load policy, target policy, and optimizer. Keeps current LR from config."""
+        file = os.path.join(checkpoint_path, filename)
+        checkpoint = torch.load(file, map_location=self.device)
+
+        # Policies
+        self.policy.load_state_dict(checkpoint["policy_state_dict"], strict=strict)
+        if "policy_old_state_dict" in checkpoint:
+            self.policy_old.load_state_dict(checkpoint["policy_old_state_dict"], strict=strict)
+        else:
+            # fallback if older checkpoints didn't save policy_old separately
+            self.policy_old.load_state_dict(checkpoint["policy_state_dict"], strict=strict)
+
+        # Optimizer
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # ensure LR matches current config (avoid restoring stale LR from the checkpoint)
+        if "lr_actor" in self.config:
+            for g in self.optimizer.param_groups:
+                g["lr"] = self.config["lr_actor"]
+
+        logger.info(f"[LOAD] gridGPTAgent checkpoint loaded from {file}")
+        return True
