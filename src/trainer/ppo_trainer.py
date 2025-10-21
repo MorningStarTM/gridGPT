@@ -129,7 +129,7 @@ class AgentTrainer:
                 if not is_safe:
                     action_idx, grid_action, logprob, value, state_vec = self.agent.select_action(state.to_vect())
                 else:
-                    grid_action = self.env.action_space
+                    grid_action = self.env.action_space.sample()
                     action_idx, logprob, value, state_vec = -1, None, None, None
 
                 state, reward, done, _ = self.env.step(grid_action)
