@@ -129,7 +129,7 @@ class AgentTrainer:
                 if not is_safe:
                     action_idx, grid_action, logprob, value, state_vec = self.agent.select_action(state.to_vect())
                 else:
-                    grid_action = self.env.action_space()
+                    grid_action = self.env.action_space
                     action_idx, logprob, value, state_vec = -1, None, None, None
 
                 state, reward, done, _ = self.env.step(grid_action)
@@ -151,7 +151,11 @@ class AgentTrainer:
 
                 # update PPO agent
                 if time_step % self.config['update_timestep'] == 0:
-                    self.agent.update()
+                    if len(self.agent.buffer.rewards) > 0:   # <— guard
+                        self.agent.update()
+                    else:
+                        # optional: log once so you know why update was skipped
+                        logger.info("Skipped PPO.update(): buffer empty (all steps were 'safe').")
 
                 # if continuous action space; then decay action std of ouput action distribution
                 if self.config['has_continuous_action_space'] and time_step % self.config['action_std_decay_freq'] == 0:
