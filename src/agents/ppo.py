@@ -256,6 +256,7 @@ class PPO:
         old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+        print(old_state_values.shape, old_actions.shape), 
 
         # calculate advantages
         #logger.info(f"rewards shape: {rewards.shape}, old_state_values shape: {old_state_values.shape}")
