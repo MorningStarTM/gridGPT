@@ -595,9 +595,41 @@ class gridGPTAC(nn.Module):
         self.state_values.append(value)
 
         return action.item()
+    
+
+    def calculateLoss(self, gamma=0.99):
+        if not (self.logprobs and self.state_values and self.rewards):
+            logger.error("Warning: Empty memory buffers!")
+            return torch.tensor(0.0, device=self.device)
+        
+
+        # calculating discounted rewards:
+        rewards = []
+        dis_reward = 0
+        for reward in self.rewards[::-1]:
+            dis_reward = reward + gamma * dis_reward
+            rewards.insert(0, dis_reward)
+                
+        # normalizing the rewards:
+       
+        rewards = torch.tensor(rewards).to(self.device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        
+        loss = 0
+        for logprob, value, reward in zip(self.logprobs, self.state_values, rewards):
+            advantage = reward  - value.item()
+            action_loss = -logprob * advantage
+            value_loss = F.smooth_l1_loss(value, reward.unsqueeze(0))
+            loss += (action_loss + value_loss)   
+        return loss
+    
+    def clearMemory(self):
+        del self.logprobs[:]
+        del self.state_values[:]
+        del self.rewards[:]
 
 
-    def save(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
+    def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
         if checkpoint_path:
             os.makedirs(checkpoint_path, exist_ok=True)
         checkpoint = {
@@ -610,12 +642,11 @@ class gridGPTAC(nn.Module):
         logger.info(f"[SAVE] Checkpoint saved to {save_path}")
 
 
-    def load(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
+    def load(self, checkpoint_path, filename="gpt_checkpoint.pth"):
         file = os.path.join(checkpoint_path, filename)
         checkpoint = torch.load(file, map_location=self.device)
 
         self.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.policy.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"[LOAD] Checkpoint loaded from {file}")
         return True
