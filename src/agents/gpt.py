@@ -531,8 +531,12 @@ class gridGPTAC(nn.Module):
         self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
 
         self.logprobs = []
+        self.student_logits = []
         self.state_values = []
         self.rewards = []
+
+        self.kl_coef = 0.1                 # weight for distillation term
+        self.distill_temperature = 1.0
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.config['lr'], betas=self.config['betas'])
         self.to(self.device)
@@ -593,11 +597,12 @@ class gridGPTAC(nn.Module):
         
         self.logprobs.append(dist.log_prob(action))
         self.state_values.append(value)
+        self.student_logits.append(logits)
 
         return action.item()
     
 
-    def calculateLoss(self, gamma=0.99):
+    def calculateLoss(self, teacher_logits, gamma=0.99):
         if not (self.logprobs and self.state_values and self.rewards):
             logger.error("Warning: Empty memory buffers!")
             return torch.tensor(0.0, device=self.device)
@@ -621,6 +626,53 @@ class gridGPTAC(nn.Module):
             action_loss = -logprob * advantage
             value_loss = F.smooth_l1_loss(value, reward.unsqueeze(0))
             loss += (action_loss + value_loss)   
+
+        #  KL distillation: make student match teacher
+        #  Shapes expected: [T, A] for both; if teacher gives [T, L, A], we take last slot.
+        A = len(self.logprobs)
+        # 1) collect student logits to [N, A]
+        student_logits = torch.stack(self.student_logits, dim=0).to(self.device)  # e.g. [T, A] or [T, B, A]
+        if student_logits.dim() == 3 and student_logits.size(-1) == A:
+            student_logits = student_logits.reshape(-1, A)  # [T*B, A]
+        elif student_logits.dim() == 2 and student_logits.size(-1) == A:
+            pass  # [T, A]
+        else:
+            if student_logits.size(-1) != A:
+                raise RuntimeError(f"Student logits last dim {student_logits.size(-1)} != action_size {A}")
+            student_logits = student_logits.reshape(-1, A)  # generic fallback
+
+        # 2) normalize teacher logits to [N, A]
+        t = teacher_logits.to(self.device)  # you pass this in when calling calculateLoss(...)
+        if t.dim() == 2:
+            if t.size(-1) == A:
+                teach = t                              # [B, A]
+            elif t.size(0) == A:
+                teach = t.transpose(0, 1).contiguous() # [A, B] -> [B, A]
+            else:
+                raise RuntimeError(f"Cannot find action dim in teacher logits shape {tuple(t.shape)} with A={A}")
+        else:
+            # move the dimension equal to A to the last, then flatten
+            dims_with_A = [i for i, s in enumerate(t.shape) if s == A]
+            if len(dims_with_A) != 1:
+                raise RuntimeError(f"Ambiguous teacher logits shape {tuple(t.shape)} for A={A}")
+            k = dims_with_A[0]
+            perm = [i for i in range(t.dim()) if i != k] + [k]
+            teach = t.permute(*perm).contiguous().reshape(-1, A)
+
+        # 3) align lengths (time×batch)
+        N = min(student_logits.size(0), teach.size(0))
+        stud  = student_logits[:N]
+        teach = teach[:N].detach()  # don't backprop through teacher
+
+        # 4) temperature + KL(teacher || student)
+        tau     = float(getattr(self, "distill_temperature", 1.0))  # set in __init__ if you want
+        kl_coef = float(getattr(self, "kl_coef", 0.1))               # set in __init__ if you want
+
+        student_logp = F.log_softmax(stud / tau, dim=-1)
+        teacher_p    = F.softmax(teach / tau, dim=-1)
+        kl_loss = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (tau * tau)
+        
+        loss += kl_coef * kl_loss
         return loss
     
     def clearMemory(self):
