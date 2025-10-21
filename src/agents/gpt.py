@@ -485,3 +485,137 @@ class gridGPTAgent:
 
         logger.info(f"[LOAD] gridGPTAgent checkpoint loaded from {file}")
         return True
+    
+
+
+
+
+
+class gridGPTAC(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = {
+            'action_size': 178,
+            'block_size': 64,
+            'state_dim': 493,
+            'n_embd': 128,
+            'fusion_embed_dim': 3 * 128,  # 3 * n_embd
+            'n_head': 4,
+            'head_size': 32,
+            'n_layers': 4,
+            'dropout': 0.1,
+            'context_len': 16,       # window length L (slot indices 0..L-1)
+            'max_timestep': 10000,    # max absolute env step used for embeddings
+        }
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+        # ===== embeddings =====
+        self.prev_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
+        self.action_embedding     = nn.Embedding(self.config['action_size'], self.config['n_embd'])
+        self.next_state_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
+        self.trajectory_embedding = nn.Linear(self.config['fusion_embed_dim'], self.config['n_embd'])
+
+        # ===== HYBRID POSITIONAL ENCODING (NEW) =====
+        # learned slot embedding (relative position inside the window) and absolute time embedding
+        self.idx_embedding  = nn.Embedding(self.config['context_len'], self.config['n_embd'])
+        self.time_embedding = nn.Embedding(self.config['max_timestep'], self.config['n_embd'])
+        # FiLM-style scale/shift produced from the positional vector
+        self.trajectory_positional_embedding = nn.Linear(self.config['n_embd'], self.config['n_embd'] * 2)
+
+        # heads 
+        self.ln_f   = nn.LayerNorm(self.config['n_embd'])
+        self.lm_head= nn.Linear(self.config['n_embd'], self.config['action_size'])
+        self.value_head = nn.Linear(self.config['n_embd'], 1)
+
+        self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
+
+        self.logprobs = []
+        self.state_values = []
+        self.rewards = []
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.config['lr'], betas=self.config['betas'])
+        self.to(self.device)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, prev_state, action, next_state, slot_idx=None, timestep=None, action_mask_last=None, return_value=False):
+        """
+        Args:
+            prev_state: [B, state_dim]    previous state S_{t-1}
+            action:     [B] or [B,1]      previous action A_{t-1} (Long)
+            next_state: [B, state_dim]    current state S_t
+            slot_idx:   [B] (Long, 0..L-1) OPTIONAL window slot index for this token
+            timestep:   [B] (Long, 0..max_timestep-1) OPTIONAL absolute env step
+
+        Returns:
+            logits: [B, action_size]  action logits for A_t
+        """
+        # content embeddings → fuse into a token
+        B, L, _ = prev_state.shape
+
+        # 1) content embeddings per slot
+        e_prev = self.prev_state_embedding(prev_state)        # [B, L, n_embd]
+        e_act  = self.action_embedding(action)           # [B, L, n_embd]
+        e_next = self.next_state_embedding(next_state)        # [B, L, n_embd]
+
+        fused  = torch.cat([e_prev, e_act, e_next], dim=-1)    # [B, L, 3*n_embd]
+        tokens = self.trajectory_embedding(fused)              # [B, L, n_embd]  == t_k
+
+        # 2) hybrid positions per slot and add
+        pos = self.idx_embedding(slot_idx) + self.time_embedding(timestep)  # [B, L, n_embd]
+        x = tokens + pos                                                     # [B, L, n_embd]
+
+        # 3) transformer over time (now T=L, not 1)
+        x = self.blocks(x)                           # [B, L, n_embd]
+        h_last = x[:, -1, :]                         # [B, n_embd] decision slot
+
+        # 4) norm → head at last slot
+        h_last = self.ln_f(h_last)                   # [B, n_embd]
+        logits = self.lm_head(h_last)                # [B, action_size]
+        if action_mask_last is not None:
+            logits = logits.masked_fill(~action_mask_last.bool(), float('-inf'))
+        
+        if not return_value:
+            return logits
+        
+        value = self.value_head(h_last).squeeze(-1)  # [B]
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        
+        self.logprobs.append(dist.log_prob(action))
+        self.state_values.append(value)
+
+        return action.item()
+
+
+    def save(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
+        if checkpoint_path:
+            os.makedirs(checkpoint_path, exist_ok=True)
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config
+        }
+        save_path = os.path.join(checkpoint_path, filename)
+        torch.save(checkpoint, save_path)
+        logger.info(f"[SAVE] Checkpoint saved to {save_path}")
+
+
+    def load(self, optimizer, checkpoint_path, filename="gpt_checkpoint.pth"):
+        file = os.path.join(checkpoint_path, filename)
+        checkpoint = torch.load(file, map_location=self.device)
+
+        self.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.policy.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f"[LOAD] Checkpoint loaded from {file}")
+        return True
