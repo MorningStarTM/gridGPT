@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-from src.agents.gpt import gridGPTAgent
+from src.agents.gpt import gridGPTAgent, gridGPTAC
 from torch.utils.data import Dataset, DataLoader
 from src.utils.logger import logger
 from collections import Counter
@@ -13,12 +13,17 @@ from grid2op.Reward import L2RPNSandBoxScore
 from src.utils.custom_reward import LossReward, MarginReward
 from grid2op.Exceptions import *
 from src.agents.ppo import PPO
+from src.agents.actor_critic import ActorCritic
+from src.utils.converter import ActionConverter
+from src.utils.saver import save_episode_rewards
+
 
 
 
 class OnlineBC:
     def __init__(self, agent:gridGPTAgent, teacher:PPO,  env, config):
         self.env = env
+        self.env_name = config['ENV_NAME']
         self.agent = agent
         self.teacher = teacher
         self.best_score = 0.0
@@ -179,7 +184,7 @@ class OnlineBC:
 
                 else:
                     # do-nothing (when safe) — keep the grid stable
-                    grid_action = self.env.action_space()  # 'do-nothing' action
+                    grid_action = self.env.action_space.sample()  # 'do-nothing' action
                     action_id, logprob, value = -1, None, None
 
 
@@ -298,3 +303,197 @@ class OnlineBC:
         np.save(os.path.join(self.reward_folder, f"ppo_{self.config['ENV_NAME']}_episode_rewards.npy"), np.array(self.episode_rewards))
         np.save(os.path.join(self.reward_folder, f"ppo_{self.env_name}_survival_steps.npy"), np.array(self.survival_steps))
         logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
+
+
+
+
+
+class OnlineBC_AC_SeqTrainer:
+    """
+    Sequence Online-BC trainer for gridGPTAC (Actor–Critic student) with
+    single-step ActorCritic teacher (for KL distillation).
+
+    """
+
+    def __init__(self, agent:gridGPTAC, teacher:ActorCritic, env:Environment, converter:ActionConverter, config):
+        self.agent     = agent         # gridGPTAC (your seq Actor–Critic)
+        self.teacher   = teacher       # ActorCritic (single-step)
+        self.env       = env
+        self.converter = converter
+        self.config    = config
+
+        self.device    = getattr(self.agent, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.optimizer = self.agent.optimizer
+
+        # logging / dirs
+        self.env_name = self.config['ENV_NAME']
+        self.log_dir = os.path.join("model_logs", self.env_name)
+        os.makedirs(self.log_dir, exist_ok=True)
+        run_num = len(next(os.walk(self.log_dir))[2])
+        self.log_f_name = os.path.join(self.log_dir, f"gridGPT_ac_seq_{self.env_name}_log_{run_num}.csv")
+
+        self.model_dir = os.path.join("models", self.env_name, "gridGPT_ac_seq")
+        os.makedirs(self.model_dir, exist_ok=True)
+        self.reward_dir = os.path.join("Rewards", self.env_name, "gridGPT_ac_seq")
+        os.makedirs(self.reward_dir, exist_ok=True)
+
+        self.episode_rewards = []
+        self.step_rewards    = []
+        self.survival_steps  = []
+
+        # shorthand to student policy config
+        pcfg = self.agent.config if hasattr(self.agent, "config") else self.agent.config
+        self.L         = pcfg['context_len']
+        self.state_dim = pcfg['state_dim']
+        self.action_sz = pcfg['action_size']
+        self.tmax      = pcfg['max_timestep']
+
+        # update schedule
+        self.update_freq = int(self.config.get("update_freq", 512))
+        self.gamma       = float(self.config.get("gamma", 0.99))
+
+    def _teacher_logits(self, state_vec: np.ndarray) -> torch.Tensor:
+        """
+        Produce teacher logits (shape [A]) from a single state vector without
+        touching teacher memory (no sampling, no logprob append).
+        """
+        with torch.no_grad():
+            s = torch.as_tensor(state_vec, dtype=torch.float32, device=self.teacher.device)
+            z = self.teacher.network(s)               # [256] pre-activation path (your net ends with Linear(512,256))
+            logits = self.teacher.policy(z)           # [A] raw scores
+        return logits.detach().to(self.agent.device)
+
+    def train(self):
+        logger.info("===============================================")
+        logger.info(" OnlineBC-AC (Sequence) — training started")
+        logger.info("===============================================")
+        start_time = datetime.now().replace(microsecond=0)
+        logger.info("Started at (GMT): %s", start_time)
+
+        # log csv
+        with open(self.log_f_name, "w+") as log_f:
+            log_f.write("episode,timestep,ep_reward\n")
+
+        time_step = 0
+
+        for i_ep in range(int(self.config['episodes'])):
+            state = self.env.reset()
+            ep_reward = 0.0
+            teacher_logits_ep = []  # list of [A] tensors for this episode
+
+            # sliding windows (B=1)
+            window_prev_states = torch.zeros(self.L, self.state_dim, device=self.device)   # [L,S]
+            window_next_states = torch.zeros(self.L, self.state_dim, device=self.device)   # [L,S]
+            window_actions     = torch.zeros(self.L, dtype=torch.long, device=self.device) # [L]
+
+            slot_idx_full   = torch.arange(self.L, device=self.device).unsqueeze(0)        # [1,L]
+            action_mask_last= torch.ones(1, self.action_sz, dtype=torch.bool, device=self.device)
+
+            s_prev = None
+            a_prev = 0   # no-op action id
+
+            for t in range(1, int(self.config['max_ep_len']) + 1):
+                # current state -> tensor
+                s_np = state.to_vect()
+                s_t  = torch.from_numpy(s_np).to(self.device).float()
+
+                # roll windows
+                window_prev_states = torch.roll(window_prev_states, shifts=-1, dims=0)
+                window_next_states = torch.roll(window_next_states, shifts=-1, dims=0)
+                window_actions     = torch.roll(window_actions,     shifts=-1, dims=0)
+
+                # fill tail slot
+                if t == 1 or s_prev is None:
+                    prev_slot, last_action = torch.zeros(self.state_dim, device=self.device), 0
+                else:
+                    prev_slot, last_action = s_prev, int(a_prev)
+
+                window_prev_states[-1] = prev_slot
+                window_next_states[-1] = s_t
+                window_actions[-1]     = last_action
+
+                # batchify to [1,L,...]
+                prev_b = window_prev_states.unsqueeze(0)   # [1,L,S]
+                next_b = window_next_states.unsqueeze(0)   # [1,L,S]
+                act_b  = window_actions.unsqueeze(0)       # [1,L]
+
+                base = (t - 1) - (self.L - 1)
+                times = torch.clamp(torch.arange(base, base + self.L, device=self.device), 0, self.tmax - 1)
+                tstep_b = times.unsqueeze(0)               # [1,L]
+
+                # ---- student: sample action & record memory (logprobs, values, student_logits) ----
+                # gridGPTAC.forward(..., return_value=True) returns an int action and FILLs memory.
+                action_id = self.agent(prev_b, act_b, next_b,
+                                       slot_idx=slot_idx_full,
+                                       timestep=tstep_b,
+                                       action_mask_last=action_mask_last,
+                                       return_value=True)      # -> int
+
+                # env action
+                env_action = self.converter.act(int(action_id))
+
+                # ---- teacher: collect logits for this step (from CURRENT state) ----
+                teacher_logits_step = self._teacher_logits(s_np)   # [A]
+                teacher_logits_ep.append(teacher_logits_step)
+
+                # step env
+                next_state, reward, done, info = self.env.step(env_action)
+                ep_reward += reward
+                self.step_rewards.append(reward)
+
+                # push reward to student (for its AC loss)
+                self.agent.rewards.append(float(reward))
+
+                time_step += 1
+                s_prev = s_t
+                a_prev = int(action_id)
+                state  = next_state
+
+                # periodic optimize
+                if (time_step % self.update_freq) == 0:
+                    if len(teacher_logits_ep) > 0:
+                        t_logits = torch.stack(teacher_logits_ep, dim=0)  # [T, A]
+                    else:
+                        t_logits = torch.empty((0, self.action_sz), device=self.device)
+                    self.optimizer.zero_grad()
+                    loss = self.agent.calculateLoss(teacher_logits=t_logits, gamma=self.gamma)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
+                    self.optimizer.step()
+                    self.agent.clearMemory()
+                    teacher_logits_ep.clear()  # reset after update
+
+                if done:
+                    self.survival_steps.append(t)
+                    break
+
+            # episode-end optimize (flush tail)
+            if len(self.agent.rewards) > 0 and len(teacher_logits_ep) > 0:
+                t_logits = torch.stack(teacher_logits_ep, dim=0)  # [T,A]
+                self.optimizer.zero_grad()
+                loss = self.agent.calculateLoss(teacher_logits=t_logits, gamma=self.gamma)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
+                self.optimizer.step()
+                self.agent.clearMemory()
+
+            self.episode_rewards.append(ep_reward)
+
+            # log line
+            with open(self.log_f_name, "a+") as log_f:
+                log_f.write(f"{i_ep},{time_step},{ep_reward:.6f}\n")
+
+            # save model periodically
+            if (i_ep + 1) % int(self.config.get('save_model_freq', 50)) == 0:
+                self.agent.save(self.model_dir)
+
+        # wrap-up
+        self.env.close()
+        end_time = datetime.now().replace(microsecond=0)
+        logger.info("Finished at (GMT): %s", end_time)
+        logger.info("Total time: %s", end_time - start_time)
+
+        np.save(os.path.join(self.reward_dir, "step_rewards.npy"), np.array(self.step_rewards))
+        np.save(os.path.join(self.reward_dir, "episode_rewards.npy"), np.array(self.episode_rewards))
+        np.save(os.path.join(self.reward_dir, "survival_steps.npy"), np.array(self.survival_steps))
+        logger.info("Saved rewards to %s", self.reward_dir)
