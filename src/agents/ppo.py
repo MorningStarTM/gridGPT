@@ -64,7 +64,7 @@ class ActorCritic(nn.Module):
                                 nn.Linear(64, 64),
                                 nn.Tanh(),
                                 nn.Linear(64, action_dim),
-                                nn.Softmax(dim=-1)
+                                #nn.Softmax(dim=-1)
                             )
             logger.info(f"Network initialized for actor")
 
@@ -109,16 +109,19 @@ class ActorCritic(nn.Module):
             cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
             dist = MultivariateNormal(action_mean, cov_mat)
         else:
-            action_probs = self.actor(state)
-            if torch.isnan(action_probs).any():
-                raise RuntimeError("NaN in actor logits during act(); check input state pipeline.")
-            dist = Categorical(action_probs)
+            logits = self.actor(state)
+            # Clamp and sanitize to avoid NaNs/Infs propagating into the distribution
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+            logits = logits.clamp(min=-50.0, max=50.0)
+            if not torch.isfinite(logits).all():
+                raise RuntimeError("Non-finite logits in act(); check state pipeline.")
+            dist = Categorical(logits=logits)  # use logits, not probs
 
         action = dist.sample()
         action_logprob = dist.log_prob(action)
         state_val = self.critic(state)
 
-        return action.detach(), action_logprob.detach(), state_val.detach(), action_probs
+        return action.detach(), action_logprob.detach(), state_val.detach(), logits
     
     def evaluate(self, state, action):
 
@@ -133,13 +136,18 @@ class ActorCritic(nn.Module):
             if self.action_dim == 1:
                 action = action.reshape(-1, self.action_dim)
         else:
-            action_probs = self.actor(state)
-            dist = Categorical(action_probs)
+            logits = self.actor(state)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+            logits = logits.clamp(min=-50.0, max=50.0)
+            if not torch.isfinite(logits).all():
+                # Quick guard so you see which batch/time it happens
+                raise RuntimeError("Non-finite logits in evaluate(); likely bad states.")
+            dist = Categorical(logits=logits)
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
         state_values = self.critic(state)
         
-        return action_logprobs, state_values, dist_entropy, action_probs
+        return action_logprobs, state_values, dist_entropy, logits
     
 
 
@@ -256,6 +264,9 @@ class PPO:
         old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+
+        old_states = torch.nan_to_num(old_states, nan=0.0, posinf=1e6, neginf=-1e6)
+
         
 
         # calculate advantages
@@ -264,7 +275,8 @@ class PPO:
 
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
-
+            if not torch.isfinite(old_states).all():
+                raise RuntimeError("Non-finite old_states detected before PPO update()")
             # Evaluating old actions and values
             logprobs, state_values, dist_entropy,_ = self.policy.evaluate(old_states, old_actions)
 
@@ -284,6 +296,8 @@ class PPO:
             # take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
+            if not torch.isfinite(loss.mean()):
+                raise RuntimeError("NaN/Inf in loss; aborting step to protect weights.")
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
             self.optimizer.step()
             
