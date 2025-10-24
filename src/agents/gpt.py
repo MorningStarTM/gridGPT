@@ -492,23 +492,9 @@ class gridGPTAgent:
 
 
 class gridGPTAC(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.config = {
-            'action_size': 178,
-            'block_size': 64,
-            'state_dim': 467,
-            'n_embd': 128,
-            'lr': 1e-4,
-            'fusion_embed_dim': 3 * 128,  # 3 * n_embd
-            'n_head': 4,
-            'head_size': 32,
-            'n_layers': 4,
-            'dropout': 0.1,
-            'betas': (0.9, 0.999),
-            'context_len': 16,       # window length L (slot indices 0..L-1)
-            'max_timestep': 10000,    # max absolute env step used for embeddings
-        }
+        self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
