@@ -265,7 +265,18 @@ class PPO:
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
 
-        old_states = torch.nan_to_num(old_states, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Sanitize only when needed
+        if not torch.isfinite(old_states).all():
+            logger.warning("Non-finite old_states detected; applying nan_to_num.")
+            old_states = torch.nan_to_num(old_states, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        if not torch.isfinite(old_state_values).all():
+            logger.warning("Non-finite old_states value detected; applying nan_to_num.")
+            old_state_values = torch.nan_to_num(old_state_values, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        if not torch.isfinite(old_logprobs).all():
+            logger.warning("Non-finite old logprobs detected; applying nan_to_num.")
+            old_logprobs = torch.nan_to_num(old_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
 
         
 
