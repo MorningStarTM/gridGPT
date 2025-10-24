@@ -321,6 +321,8 @@ class OnlineBC_AC_SeqTrainer:
         self.env       = env
         self.converter = converter
         self.config    = config
+        self.danger = 0.9
+        self.thermal_limit = self.env._thermal_limit_a
 
         self.device    = getattr(self.agent, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.optimizer = self.agent.optimizer
@@ -351,6 +353,14 @@ class OnlineBC_AC_SeqTrainer:
         # update schedule
         self.update_freq = int(self.config.get("update_freq", 512))
         self.gamma       = float(self.config.get("gamma", 0.99))
+    
+    def is_safe(self, obs):
+        
+        for ratio, limit in zip(obs.rho, self.thermal_limit):
+            # Seperate big line and small line
+            if (limit < 400.00 and ratio >= self.danger - 0.05) or ratio >= self.danger:
+                return False
+        return True
 
     def _teacher_logits(self, state_vec: np.ndarray) -> torch.Tensor:
         """
@@ -364,6 +374,7 @@ class OnlineBC_AC_SeqTrainer:
         return logits.detach().to(self.agent.device)
 
     def train(self):
+        running_reward = 0
         logger.info("===============================================")
         logger.info(" OnlineBC-AC (Sequence) — training started")
         logger.info("===============================================")
@@ -421,20 +432,22 @@ class OnlineBC_AC_SeqTrainer:
                 times = torch.clamp(torch.arange(base, base + self.L, device=self.device), 0, self.tmax - 1)
                 tstep_b = times.unsqueeze(0)               # [1,L]
 
+                is_safe = self.is_safe(state)
+
                 # ---- student: sample action & record memory (logprobs, values, student_logits) ----
                 # gridGPTAC.forward(..., return_value=True) returns an int action and FILLs memory.
-                action_id = self.agent(prev_b, act_b, next_b,
-                                       slot_idx=slot_idx_full,
-                                       timestep=tstep_b,
-                                       action_mask_last=action_mask_last,
-                                       return_value=True)      # -> int
+                if not is_safe:
+                    action_id = self.agent(prev_b, act_b, next_b,
+                                        slot_idx=slot_idx_full,
+                                        timestep=tstep_b,
+                                        action_mask_last=action_mask_last,
+                                        return_value=True)      # -> int
 
-                # env action
-                env_action = self.converter.act(int(action_id))
-
-                # ---- teacher: collect logits for this step (from CURRENT state) ----
-                teacher_logits_step = self._teacher_logits(s_np)   # [A]
-                teacher_logits_ep.append(teacher_logits_step)
+                    # env action
+                    env_action = self.converter.act(int(action_id))
+                
+                else:
+                    env_action = self.env.action_space({})  # 'do-nothing' action
 
                 # step env
                 next_state, reward, done, info = self.env.step(env_action)
@@ -442,40 +455,25 @@ class OnlineBC_AC_SeqTrainer:
                 self.step_rewards.append(reward)
 
                 # push reward to student (for its AC loss)
-                self.agent.rewards.append(float(reward))
+                if not is_safe:
+                    self.agent.rewards.append(float(reward))
 
                 time_step += 1
                 s_prev = s_t
                 a_prev = int(action_id)
                 state  = next_state
 
-                # periodic optimize
-                if (time_step % self.update_freq) == 0:
-                    if len(teacher_logits_ep) > 0:
-                        t_logits = torch.stack(teacher_logits_ep, dim=0)  # [T, A]
-                    else:
-                        t_logits = torch.empty((0, self.action_sz), device=self.device)
-                    self.optimizer.zero_grad()
-                    loss = self.agent.calculateLoss(teacher_logits=t_logits, gamma=self.gamma)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
-                    self.optimizer.step()
-                    self.agent.clearMemory()
-                    teacher_logits_ep.clear()  # reset after update
-
                 if done:
                     self.survival_steps.append(t)
                     break
 
             # episode-end optimize (flush tail)
-            if len(self.agent.rewards) > 0 and len(teacher_logits_ep) > 0:
-                t_logits = torch.stack(teacher_logits_ep, dim=0)  # [T,A]
-                self.optimizer.zero_grad()
-                loss = self.agent.calculateLoss(teacher_logits=t_logits, gamma=self.gamma)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
-                self.optimizer.step()
-                self.agent.clearMemory()
+            self.optimizer.zero_grad()
+            loss = self.agent.calculateLoss(gamma=self.gamma)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
+            self.optimizer.step()
+            self.agent.clearMemory()
 
             self.episode_rewards.append(ep_reward)
 
@@ -484,8 +482,13 @@ class OnlineBC_AC_SeqTrainer:
                 log_f.write(f"{i_ep},{time_step},{ep_reward:.6f}\n")
 
             # save model periodically
-            if (i_ep + 1) % int(self.config.get('save_model_freq', 50)) == 0:
+            if i_ep != 0 and i_ep % 1000 == 0:
                 self.agent.save(self.model_dir)
+            
+            if i_ep % 20 == 0:
+                running_reward = running_reward/20
+                logger.info('Episode {}\tlength: {}\treward: {}'.format(i_ep, t, ep_reward))
+                running_reward = 0
 
         # wrap-up
         self.env.close()
