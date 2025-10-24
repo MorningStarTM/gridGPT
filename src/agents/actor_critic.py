@@ -10,8 +10,6 @@ from grid2op.Reward import L2RPNSandBoxScore
 import os
 from src.utils.logger import logger
 import torch.optim as optim
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_add_pool
-from torch_geometric.utils import add_self_loops
 
 
 
