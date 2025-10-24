@@ -497,13 +497,15 @@ class gridGPTAC(nn.Module):
         self.config = {
             'action_size': 178,
             'block_size': 64,
-            'state_dim': 493,
+            'state_dim': 467,
             'n_embd': 128,
+            'lr': 1e-4,
             'fusion_embed_dim': 3 * 128,  # 3 * n_embd
             'n_head': 4,
             'head_size': 32,
             'n_layers': 4,
             'dropout': 0.1,
+            'betas': (0.9, 0.999),
             'context_len': 16,       # window length L (slot indices 0..L-1)
             'max_timestep': 10000,    # max absolute env step used for embeddings
         }
@@ -552,57 +554,75 @@ class gridGPTAC(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, prev_state, action, next_state, slot_idx=None, timestep=None, action_mask_last=None, return_value=False):
-        """
-        Args:
-            prev_state: [B, state_dim]    previous state S_{t-1}
-            action:     [B] or [B,1]      previous action A_{t-1} (Long)
-            next_state: [B, state_dim]    current state S_t
-            slot_idx:   [B] (Long, 0..L-1) OPTIONAL window slot index for this token
-            timestep:   [B] (Long, 0..max_timestep-1) OPTIONAL absolute env step
+        # 0) sanitize inputs
+        prev_state = self._safe(prev_state, "prev_state")
+        next_state = self._safe(next_state, "next_state")
 
-        Returns:
-            logits: [B, action_size]  action logits for A_t
-        """
-        # content embeddings → fuse into a token
-        B, L, _ = prev_state.shape
+        B, L, S = prev_state.shape
+        assert next_state.shape == (B, L, S)
+        assert action.shape == (B, L)
 
-        # 1) content embeddings per slot
-        e_prev = self.prev_state_embedding(prev_state)        # [B, L, n_embd]
-        e_act  = self.action_embedding(action)           # [B, L, n_embd]
-        e_next = self.next_state_embedding(next_state)        # [B, L, n_embd]
+        # 1) index guards for embeddings
+        self._check_idx(action, self.config['action_size'], "action")
+        self._check_idx(slot_idx, self.config['context_len'], "slot_idx")
+        self._check_idx(timestep, self.config['max_timestep'], "timestep")
 
-        fused  = torch.cat([e_prev, e_act, e_next], dim=-1)    # [B, L, 3*n_embd]
-        tokens = self.trajectory_embedding(fused)              # [B, L, n_embd]  == t_k
+        # 2) content embeddings
+        e_prev = self.prev_state_embedding(prev_state)        # [B,L,E]
+        e_act  = self.action_embedding(action)                # [B,L,E]
+        e_next = self.next_state_embedding(next_state)        # [B,L,E]
+        e_prev = self._safe(e_prev, "e_prev")
+        e_act  = self._safe(e_act,  "e_act")
+        e_next = self._safe(e_next, "e_next")
 
-        # 2) hybrid positions per slot and add
-        pos = self.idx_embedding(slot_idx) + self.time_embedding(timestep)  # [B, L, n_embd]
-        x = tokens + pos                                                     # [B, L, n_embd]
+        fused  = torch.cat([e_prev, e_act, e_next], dim=-1)   # [B,L,3E]
+        tokens = self.trajectory_embedding(fused)             # [B,L,E]
+        tokens = self._safe(tokens, "tokens")
 
-        # 3) transformer over time (now T=L, not 1)
-        x = self.blocks(x)                           # [B, L, n_embd]
-        h_last = x[:, -1, :]                         # [B, n_embd] decision slot
+        # 3) hybrid positions
+        pos = self.idx_embedding(slot_idx) + self.time_embedding(timestep)  # [B,L,E]
+        pos = self._safe(pos, "pos")
+        x = tokens + pos
+        x = self._safe(x, "x(tokens+pos)")
 
-        # 4) norm → head at last slot
-        h_last = self.ln_f(h_last)                   # [B, n_embd]
-        logits = self.lm_head(h_last)                # [B, action_size]
+        # 4) transformer
+        x = self.blocks(x)                                    # [B,L,E]
+        x = self._safe(x, "x(blocks)")
+        h_last = x[:, -1, :]                                  # [B,E]
+
+        # 5) heads
+        h_last = self.ln_f(h_last)
+        h_last = self._safe(h_last, "h_last(ln_f)")
+
+        logits = self.lm_head(h_last)                         # [B,A]
+        logits = self._safe(logits, "logits(pre-mask)")
+
         if action_mask_last is not None:
             logits = logits.masked_fill(~action_mask_last.bool(), float('-inf'))
-        
+
+        # If everything got masked or something went off, rescue to finite logits
+        if not torch.isfinite(logits).all() or torch.isneginf(logits).all():
+            # Optional one-time noisy log
+            # print("[RESCUE] logits had non-finite or all -inf; replacing with zeros.")
+            logits = torch.zeros_like(logits)
+
         if not return_value:
             return logits
-        
-        value = self.value_head(h_last).squeeze(-1)  # [B]
-        dist = Categorical(logits=logits)
+
+        value = self.value_head(h_last).squeeze(-1)           # [B]
+        value = self._safe(value, "value")
+
+        dist = Categorical(logits=logits)                     # now guaranteed finite
         action = dist.sample()
-        
+
         self.logprobs.append(dist.log_prob(action))
         self.state_values.append(value)
-        self.student_logits.append(logits)
+        self.student_logits.append(logits.detach())           # keep detached logits
 
         return action.item()
     
 
-    def calculateLoss(self, teacher_logits, gamma=0.99):
+    def calculateLoss(self, gamma=0.99):
         if not (self.logprobs and self.state_values and self.rewards):
             logger.error("Warning: Empty memory buffers!")
             return torch.tensor(0.0, device=self.device)
@@ -627,58 +647,25 @@ class gridGPTAC(nn.Module):
             value_loss = F.smooth_l1_loss(value, reward.unsqueeze(0))
             loss += (action_loss + value_loss)   
 
-        #  KL distillation: make student match teacher
-        #  Shapes expected: [T, A] for both; if teacher gives [T, L, A], we take last slot.
-        A = len(self.logprobs)
-        # 1) collect student logits to [N, A]
-        student_logits = torch.stack(self.student_logits, dim=0).to(self.device)  # e.g. [T, A] or [T, B, A]
-        if student_logits.dim() == 3 and student_logits.size(-1) == A:
-            student_logits = student_logits.reshape(-1, A)  # [T*B, A]
-        elif student_logits.dim() == 2 and student_logits.size(-1) == A:
-            pass  # [T, A]
-        else:
-            if student_logits.size(-1) != A:
-                raise RuntimeError(f"Student logits last dim {student_logits.size(-1)} != action_size {A}")
-            student_logits = student_logits.reshape(-1, A)  # generic fallback
-
-        # 2) normalize teacher logits to [N, A]
-        t = teacher_logits.to(self.device)  # you pass this in when calling calculateLoss(...)
-        if t.dim() == 2:
-            if t.size(-1) == A:
-                teach = t                              # [B, A]
-            elif t.size(0) == A:
-                teach = t.transpose(0, 1).contiguous() # [A, B] -> [B, A]
-            else:
-                raise RuntimeError(f"Cannot find action dim in teacher logits shape {tuple(t.shape)} with A={A}")
-        else:
-            # move the dimension equal to A to the last, then flatten
-            dims_with_A = [i for i, s in enumerate(t.shape) if s == A]
-            if len(dims_with_A) != 1:
-                raise RuntimeError(f"Ambiguous teacher logits shape {tuple(t.shape)} for A={A}")
-            k = dims_with_A[0]
-            perm = [i for i in range(t.dim()) if i != k] + [k]
-            teach = t.permute(*perm).contiguous().reshape(-1, A)
-
-        # 3) align lengths (time×batch)
-        N = min(student_logits.size(0), teach.size(0))
-        stud  = student_logits[:N]
-        teach = teach[:N].detach()  # don't backprop through teacher
-
-        # 4) temperature + KL(teacher || student)
-        tau     = float(getattr(self, "distill_temperature", 1.0))  # set in __init__ if you want
-        kl_coef = float(getattr(self, "kl_coef", 0.1))               # set in __init__ if you want
-
-        student_logp = F.log_softmax(stud / tau, dim=-1)
-        teacher_p    = F.softmax(teach / tau, dim=-1)
-        kl_loss = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (tau * tau)
-        
-        loss += kl_coef * kl_loss
         return loss
-    
+
+    def _safe(self, t: torch.Tensor, name: str):
+        if not torch.isfinite(t).all():
+            bad = ~torch.isfinite(t)
+            # Optional one-time noisy log
+            # print(f"[SAFE] Repaired non-finite values in {name}: {bad.sum().item()} elements")
+            t = torch.nan_to_num(t, nan=0.0, posinf=1e6, neginf=-1e6)
+        return t
+
+    def _check_idx(self, idx: torch.Tensor, size: int, name: str):
+        if idx.min().item() < 0 or idx.max().item() >= size:
+            raise RuntimeError(f"{name} out of range [0,{size-1}]: min={idx.min().item()} max={idx.max().item()}")
+
     def clearMemory(self):
         del self.logprobs[:]
         del self.state_values[:]
         del self.rewards[:]
+        del self.student_logits[:]
 
 
     def save(self, checkpoint_path, filename="gpt_checkpoint.pth"):
