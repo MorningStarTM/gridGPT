@@ -624,7 +624,7 @@ class gridGPTAC(nn.Module):
     
 
 
-    def calculateLoss(self, gamma=0.99):
+    def calculateLoss(self, teacher_logits, gamma=0.99):
         if not (self.logprobs and self.state_values and self.rewards):
             logger.error("Warning: Empty memory buffers!")
             return torch.tensor(0.0, device=self.device)
@@ -649,7 +649,9 @@ class gridGPTAC(nn.Module):
             value_loss = F.smooth_l1_loss(value, reward.unsqueeze(0))
             loss += (action_loss + value_loss)   
 
-        return loss
+        kl_loss = self.kl_distill_loss(torch.tensor(self.student_logits, device=self.device), teacher_logits)
+
+        return loss + kl_loss
 
     def _safe(self, t: torch.Tensor, name: str):
         if not torch.isfinite(t).all():
