@@ -608,6 +608,22 @@ class gridGPTAC(nn.Module):
         return action.item()
     
 
+
+
+    def kl_distill_loss(self, student_logits, teacher_logits, alpha: float = 0.8, T: float = 1.0):
+        """
+        student_logits : Tensor [B, A]  (actor's raw logits)
+        teacher_logits : Tensor [B, A]  (gridGPT's raw logits)
+        Returns: alpha * T^2 * KL(student || teacher)
+        """
+        s_logp_T = F.log_softmax(student_logits / T, dim=-1)
+        with torch.no_grad():
+            t_p_T = F.softmax(teacher_logits / T, dim=-1)
+        kl = F.kl_div(s_logp_T, t_p_T, reduction='batchmean')
+        return alpha * (T * T) * kl
+    
+
+
     def calculateLoss(self, gamma=0.99):
         if not (self.logprobs and self.state_values and self.rewards):
             logger.error("Warning: Empty memory buffers!")
