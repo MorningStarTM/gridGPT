@@ -315,17 +315,20 @@ class OnlineBC_AC_SeqTrainer:
 
     """
 
-    def __init__(self, agent:gridGPTAC, teacher:ActorCritic, env:Environment, converter:ActionConverter, config):
-        self.agent     = agent         # gridGPTAC (your seq Actor–Critic)
-        self.teacher   = teacher       # ActorCritic (single-step)
+    def __init__(self, env:Environment, converter:ActionConverter, ac_config, gpt_config):
+        self.agent     = gridGPTAC(config=gpt_config)         # gridGPTAC 
+        self.teacher   = ActorCritic(ac_config)       # ActorCritic (single-step)
         self.env       = env
         self.converter = converter
-        self.config    = config
+        self.config    = gpt_config
         self.danger = 0.9
         self.thermal_limit = self.env._thermal_limit_a
 
         self.device    = getattr(self.agent, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.optimizer = self.agent.optimizer
+
+        self.teacher.load_checkpoint(folder_name=ac_config['model_path'], filename=ac_config['file_name'])
+        logger.info("Teacher loaded from checkpoint.")
 
         # logging / dirs
         self.env_name = self.config['ENV_NAME']
