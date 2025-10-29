@@ -649,7 +649,8 @@ class gridGPTAC(nn.Module):
             value_loss = F.smooth_l1_loss(value, reward.unsqueeze(0))
             loss += (action_loss + value_loss)   
 
-        kl_loss = self.kl_distill_loss(torch.tensor(self.student_logits, device=self.device), teacher_logits)
+        student_seq = torch.stack(self.student_logits, dim=0).to(self.device)
+        kl_loss = self.kl_distill_loss(student_seq, teacher_logits)
 
         return loss + kl_loss
 
