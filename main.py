@@ -4,9 +4,11 @@ from lightsim2grid import LightSimBackend
 from grid2op.Reward import L2RPNSandBoxScore
 from src.utils.custom_reward import LossReward, MarginReward
 from src.agents.ppo import PPO
-from src.agents.gpt import gridGPTAgent
+from src.agents.actor_critic import ActorCritic
+from src.agents.gpt import gridGPTAgent, gridGPTAC
 from src.trainer.ppo_trainer import AgentTrainer
-from src.trainer.gpt_trainer import OnlineBC
+from src.utils.converter import ActionConverter
+from src.trainer.gpt_trainer import OnlineBC, OnlineBC_AC_SeqTrainer
 from src.utils.logger import logger
 
 
@@ -20,7 +22,7 @@ iconfig = {"ENV_NAME" : "l2rpn_case14_sandbox",
             'lr_critic': 1e-4,
             'lr':1e-4, 
 
-            'update_timestep': 400*3,
+            'update_timestep': 400*6,
             'gamma': 0.99,
             'K_epochs': 80,
             'eps_clip': 0.2,
@@ -45,18 +47,65 @@ iconfig = {"ENV_NAME" : "l2rpn_case14_sandbox",
             }
 
 
+
 env = grid2op.make(iconfig['ENV_NAME'],
                     reward_class=L2RPNSandBoxScore,
                     backend=LightSimBackend(),
                     other_rewards={"loss": LossReward, "margin": MarginReward})
 
-teacher = PPO(env.observation_space.shape.sum(), env=env, sublist=None, config=iconfig)
-teacher.load(checkpoint_path="E:\\github_clone\\gridGPT\\models\\l2rpn_case14_sandbox\\PPO", filename="ppo_checkpoint_2.pth")
-logger.info("Teacher loaded from checkpoint.")
 
-agent = gridGPTAgent(env=env, config=iconfig)
-logger.info("Student Agent initialized with \n")
-logger.info(f"{agent.print_param_count()}")
+converter = ActionConverter(env=env)
 
-trainer = OnlineBC(agent=agent, teacher=teacher, env=env, config=iconfig)
+
+actor_config = {
+    "ENV_NAME": iconfig['ENV_NAME'],
+    "input_dim":493, #env.observation_space.shape.sum(),
+    "action_dim":converter.n,
+    "gamma": 0.99,
+    "lr": 0.0003,
+    "betas": (0.9, 0.999),
+    "update_freq": 512,
+    "save_path":"ICM\models",
+    'episodes': 10000,
+    'max_ep_len':10000,
+    'icm_lr':1e-4,
+    'beta':1e-4,
+    'alpha':1e-4,
+    'batch_size':256,
+    'model_path' : 'models',
+    'file_name':'final_actor_critic_checkpoint.pth'
+}
+
+gpt_config = {
+            'action_size': 178,
+            'block_size': 64,
+            'state_dim': 493,
+            'n_embd': 128,
+            'lr': 1e-4,
+            'fusion_embed_dim': 3 * 128,  # 3 * n_embd
+            'n_head': 4,
+            'head_size': 32,
+            'n_layers': 4,
+            'dropout': 0.1,
+            'betas': (0.9, 0.999),
+            'context_len': 16,       # window length L (slot indices 0..L-1)
+            'max_timestep': 10000,    # max absolute env step used for embeddings
+        }
+
+
+# teacher = PPO(env.observation_space.shape.sum(), env=env, sublist=None, config=iconfig)
+# trainer = AgentTrainer(agent=teacher, env=env, config=iconfig)
+# trainer.train()
+# teacher.load(checkpoint_path="E:\\github_clone\\gridGPT\\models\\l2rpn_case14_sandbox\\PPO", filename="ppo_checkpoint_2.pth")
+# logger.info("Teacher loaded from checkpoint.")
+
+# agent = gridGPTAgent(env=env, config=iconfig)
+# logger.info("Student Agent initialized with \n")
+# logger.info(f"{agent.print_param_count()}")
+
+# trainer = OnlineBC(agent=agent, teacher=teacher, env=env, config=iconfig)
+# trainer.train()
+
+
+trainer = OnlineBC_AC_SeqTrainer(env=env, converter=converter, ac_config=actor_config, gpt_config=gpt_config)
 trainer.train()
