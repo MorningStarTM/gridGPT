@@ -16,6 +16,7 @@ from src.agents.ppo import PPO
 from src.agents.actor_critic import ActorCritic
 from src.utils.converter import ActionConverter
 from src.utils.saver import save_episode_rewards
+import torch.optim as optim
 
 
 
@@ -317,21 +318,22 @@ class OnlineBC_AC_SeqTrainer:
 
     def __init__(self, env:Environment, converter:ActionConverter, ac_config, gpt_config):
         self.agent     = gridGPTAC(config=gpt_config)         # gridGPTAC 
-        self.teacher   = ActorCritic(ac_config)       # ActorCritic (single-step)
+        self.teacher   = ActorCritic()       # ActorCritic (single-step)
         self.env       = env
         self.converter = converter
         self.config    = gpt_config
         self.danger = 0.9
         self.thermal_limit = self.env._thermal_limit_a
+        self.config = ac_config
 
         self.device    = getattr(self.agent, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.optimizer = self.agent.optimizer
-
-        self.teacher.load_checkpoint(folder_name=ac_config['model_path'], filename=ac_config['file_name'])
+        optimizer = optim.Adam(self.teacher.parameters(), lr=1e-4, betas=(0.9, 0.999))
+        self.teacher.load_checkpoint(folder_name=ac_config['model_path'], filename=ac_config['file_name'], optimizer=optimizer)
         logger.info("Teacher loaded from checkpoint.")
 
         # logging / dirs
-        self.env_name = self.config['ENV_NAME']
+        self.env_name = ac_config['ENV_NAME']
         self.log_dir = os.path.join("model_logs", self.env_name)
         os.makedirs(self.log_dir, exist_ok=True)
         run_num = len(next(os.walk(self.log_dir))[2])
@@ -387,6 +389,7 @@ class OnlineBC_AC_SeqTrainer:
         # log csv
         with open(self.log_f_name, "w+") as log_f:
             log_f.write("episode,timestep,ep_reward\n")
+        teacher_seq = []
 
         time_step = 0
 
@@ -448,9 +451,13 @@ class OnlineBC_AC_SeqTrainer:
 
                     # env action
                     env_action = self.converter.act(int(action_id))
+                    with torch.no_grad():
+                        _, logits_teacher = self.teacher(s_np)
+                        teacher_logits_ep.append(logits_teacher.squeeze(0))  # [A]
                 
                 else:
                     env_action = self.env.action_space({})  # 'do-nothing' action
+
 
                 # step env
                 next_state, reward, done, info = self.env.step(env_action)
@@ -469,10 +476,10 @@ class OnlineBC_AC_SeqTrainer:
                 if done:
                     self.survival_steps.append(t)
                     break
-
+            teacher_seq = torch.stack(teacher_logits_ep, dim=0).to(self.device)
             # episode-end optimize (flush tail)
             self.optimizer.zero_grad()
-            loss = self.agent.calculateLoss(gamma=self.gamma)
+            loss = self.agent.calculateLoss(teacher_logits=teacher_seq, gamma=self.gamma)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=0.5)
             self.optimizer.step()
