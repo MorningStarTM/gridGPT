@@ -36,7 +36,7 @@ class ICMTrainer:
 
         # student (sequence GPT-AC)
         self.agent = gridGPTAC(gpt_config)
-        self.agent.load(checkpoint_path=self.gpt_config['folder'],
+        self.agent.load(checkpoint_path=self.gpt_config['model_folder'],
                         filename=self.gpt_config['filename'])
         logger.info(f"Loaded Agent from {self.gpt_config['folder']}\\{self.gpt_config['filename']}")
 
@@ -209,7 +209,7 @@ class ICMTrainer:
 
             # periodic save
             if i_episode != 0 and (i_episode % 1000 == 0):
-                self.agent.save(checkpoint_path=self.gpt_config['folder'],
+                self.agent.save(checkpoint_path=self.gpt_config['save_folder'],
                                 filename=f"icm_gridGPT.pt")
                 self.icm.save_checkpoint(filename="final_icm.pt")
 
