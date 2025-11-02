@@ -10,7 +10,7 @@ from src.trainer.ppo_trainer import AgentTrainer
 from src.utils.converter import ActionConverter
 from src.trainer.gpt_trainer import OnlineBC, OnlineBC_AC_SeqTrainer
 from src.utils.logger import logger
-
+from src.trainer.icm_trainer import ICMTrainer
 
 iconfig = {"ENV_NAME" : "l2rpn_case14_sandbox",
             "middle_agent_type" : "capa",  # Options: "capa", "fixed_sub"
@@ -58,7 +58,7 @@ converter = ActionConverter(env=env)
 
 
 actor_config = {
-    "ENV_NAME": iconfig['ENV_NAME'],
+    "ENV_NAME": "l2rpn_case14_sandbox",
     "input_dim":493, #env.observation_space.shape.sum(),
     "action_dim":converter.n,
     "gamma": 0.99,
@@ -90,9 +90,26 @@ gpt_config = {
             'betas': (0.9, 0.999),
             'context_len': 16,       # window length L (slot indices 0..L-1)
             'max_timestep': 10000,    # max absolute env step used for embeddings
+            'folder' : 'models\\l2rpn_case14_sandbox\\gridGPT_student',
+            'filename':'gpt_checkpoint.pth'
         }
 
-
+icm_config = {
+    "input_dim":493, #env.observation_space.shape.sum(),
+    "action_dim":converter.n,
+    "gamma": 0.99,
+    "lr": 0.0003,
+    "betas": (0.9, 0.999),
+    "update_freq": 512,
+    "save_path":"models\\l2rpn_case14_sandbox\\gridGPT_student",
+    'episodes': 10000,
+    'max_ep_len':10000,
+    'icm_lr':1e-4,
+    'beta':1e-4,
+    'alpha':1e-4,
+    'batch_size':256,
+    'intrinsic_reward_weight':1,
+}
 # teacher = PPO(env.observation_space.shape.sum(), env=env, sublist=None, config=iconfig)
 # trainer = AgentTrainer(agent=teacher, env=env, config=iconfig)
 # trainer.train()
@@ -107,5 +124,8 @@ gpt_config = {
 # trainer.train()
 
 
-trainer = OnlineBC_AC_SeqTrainer(env=env, converter=converter, ac_config=actor_config, gpt_config=gpt_config)
-trainer.train()
+# trainer = OnlineBC_AC_SeqTrainer(env=env, converter=converter, ac_config=actor_config, gpt_config=gpt_config)
+# trainer.train()
+
+trainer = ICMTrainer(env=env, gpt_config=gpt_config, config=icm_config)
+trainer.fit()
