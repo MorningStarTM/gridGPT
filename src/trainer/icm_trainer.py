@@ -38,7 +38,7 @@ class ICMTrainer:
         self.agent = gridGPTAC(gpt_config)
         self.agent.load(checkpoint_path=self.gpt_config['model_folder'],
                         filename=self.gpt_config['filename'])
-        logger.info(f"Loaded Agent from {self.gpt_config['folder']}\\{self.gpt_config['filename']}")
+        logger.info(f"Loaded Agent from {self.gpt_config['model_folder']}\\{self.gpt_config['filename']}")
 
         # helpers
         self.converter = ActionConverter(env=self.env)
