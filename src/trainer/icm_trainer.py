@@ -30,6 +30,9 @@ class ICMTrainer:
         self.env        = env
         self.config     = config
         self.gpt_config = gpt_config
+        self.danger = 0.9
+        self.thermal_limit = self.env._thermal_limit_a
+
 
         # student (sequence GPT-AC)
         self.agent = gridGPTAC(gpt_config)
@@ -48,6 +51,7 @@ class ICMTrainer:
         # tracking
         self.best_survival_step = 0
         self.episode_rewards    = []
+        self.suruvival_steps    = []
 
         # sequence hyperparams from the student policy config
         pcfg = self.agent.config if hasattr(self.agent, "config") else self.gpt_config
@@ -61,9 +65,18 @@ class ICMTrainer:
                               torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
         # logging dirs
-        self.env_name   = str(self.config.get('ENV_NAME', 'ENV'))
+        self.env_name   = str(self.config.get('ENV_NAME', 'l2rpn_case14_sandbox'))
         self.reward_dir = os.path.join("Rewards", self.env_name, "icm_seq")
         os.makedirs(self.reward_dir, exist_ok=True)
+
+    
+    def is_safe(self, obs):
+        
+        for ratio, limit in zip(obs.rho, self.thermal_limit):
+            # Seperate big line and small line
+            if (limit < 400.00 and ratio >= self.danger - 0.05) or ratio >= self.danger:
+                return False
+        return True
 
     def fit(self):
         logger.info("""=======================================================
@@ -118,14 +131,19 @@ class ICMTrainer:
                                     0, self.tmax - 1)
                 tstep_b = times.unsqueeze(0)             # [1,L]
 
+                is_safe = self.is_safe(state)
+                if not is_safe:
                 # ---- student: sample action (also fills memory for AC loss) ----
-                action_id = self.agent(prev_b, act_b, next_b,
-                                       slot_idx=slot_idx_full,
-                                       timestep=tstep_b,
-                                       action_mask_last=action_mask_last,
-                                       return_value=True)    # -> int
+                    action_id = self.agent(prev_b, act_b, next_b,
+                                        slot_idx=slot_idx_full,
+                                        timestep=tstep_b,
+                                        action_mask_last=action_mask_last,
+                                        return_value=True)    # -> int
 
-                env_action = self.converter.act(int(action_id))
+                    env_action = self.converter.act(int(action_id))
+                
+                else:
+                    env_action = self.env.action_space({})
 
                 # ---- step env ----
                 next_state, extr_reward, done, info = self.env.step(env_action)
@@ -141,8 +159,9 @@ class ICMTrainer:
 
                 total_reward = float(extr_reward) + eta * intrinsic_reward
 
-                # ---- push reward to student memory ----
-                self.agent.rewards.append(total_reward)
+                if not is_safe:
+                    # ---- push reward to student memory ----
+                    self.agent.rewards.append(total_reward)
 
                 # ---- store experience for ICM training buffer (your API) ----
                 self.icm.memory.remember(state_=state_,
@@ -159,6 +178,7 @@ class ICMTrainer:
 
                 if done:
                     self.best_survival_step = max(self.best_survival_step, t)
+                    self.suruvival_steps.append(t)
                     break
 
             # ---- episode end: optimize student + ICM ----
@@ -189,8 +209,8 @@ class ICMTrainer:
 
             # periodic save
             if i_episode != 0 and (i_episode % 1000 == 0):
-                self.agent.save(checkpoint_path=self.config['folder'],
-                                filename=f"icm_actor_critic.pt")
+                self.agent.save(checkpoint_path=self.gpt_config['folder'],
+                                filename=f"icm_gridGPT.pt")
                 self.icm.save_checkpoint(filename="final_icm.pt")
 
             # log
@@ -204,6 +224,7 @@ class ICMTrainer:
         os.makedirs(os.path.join("ICM", "episode_reward"), exist_ok=True)
         np.save(os.path.join("ICM", "episode_reward", "final_actor_critic_reward.npy"),
                 np.array(self.episode_rewards, dtype=np.float32))
+        np.save(os.path.join(self.reward_dir, "survival_steps.npy"), np.array(self.survival_steps))
         logger.info("Reward saved at ICM\\episode_reward")
 
 
